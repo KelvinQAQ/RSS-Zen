@@ -375,3 +375,17 @@ def test_translation_limits_source_field_size(tmp_path: Path) -> None:
     assert provider.calls[0][0] == "English"
     assert provider.calls[1][0] == "English"
     assert provider.calls[2][0] == "This is"
+
+
+def test_google_provider_requires_deep_translator(monkeypatch) -> None:
+    """GoogleProvider raises a clear, non-retryable error when deep_translator is absent."""
+    import pytest
+
+    import rss_zen.translation as translation_module
+
+    monkeypatch.setattr(translation_module, "GoogleTranslator", None)
+    config = translation_module.TranslationProviderConfig(name="google", kind="google")
+    provider = translation_module.GoogleProvider(config)
+
+    with pytest.raises(TranslationProviderError, match="not installed"):
+        provider.translate("Hello", None, "zh-CN")

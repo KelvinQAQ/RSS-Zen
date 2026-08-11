@@ -53,7 +53,7 @@ class TranslationProviderConfig(BaseModel):
 
     name: str = Field(min_length=1)
     kind: str
-    endpoint: str
+    endpoint: str = Field(default="")
     api_key_env: str | None = None
     api_key: str | None = Field(default=None, exclude=True, repr=False)
     model: str | None = None
@@ -78,10 +78,12 @@ class TranslationProviderConfig(BaseModel):
         ),
     )
 
+    _ENDPOINT_KINDS = {"libretranslate", "mymemory", "openai_compatible"}
+
     @field_validator("kind")
     @classmethod
     def _supported_kind(cls, value: str) -> str:
-        supported = {"libretranslate", "mymemory", "openai_compatible"}
+        supported = {"libretranslate", "mymemory", "openai_compatible", "google"}
         if value not in supported:
             raise ValueError(f"unsupported translation provider kind: {value}")
         return value
@@ -89,6 +91,8 @@ class TranslationProviderConfig(BaseModel):
     @field_validator("endpoint")
     @classmethod
     def _https_endpoint(cls, value: str) -> str:
+        if not value:
+            return value
         parsed = urlparse(value)
         if parsed.scheme != "https" or not parsed.netloc:
             raise ValueError("endpoint must use HTTPS")
@@ -97,7 +101,9 @@ class TranslationProviderConfig(BaseModel):
         return value.rstrip("/")
 
     @model_validator(mode="after")
-    def _openai_provider_needs_model(self) -> TranslationProviderConfig:
+    def _provider_requirements(self) -> TranslationProviderConfig:
+        if self.kind in self._ENDPOINT_KINDS and not self.endpoint:
+            raise ValueError(f"{self.kind} providers require an endpoint")
         if self.kind == "openai_compatible" and not self.model:
             raise ValueError("openai_compatible providers require a model")
         return self
