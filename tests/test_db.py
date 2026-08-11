@@ -30,16 +30,22 @@ def _feed() -> FeedInput:
     )
 
 
-def _article(*, content: str = "Original body", guid: str | None = "article-1") -> ArticleInput:
+def _article(
+    *,
+    content: str = "Original body",
+    guid: str | None = "article-1",
+    canonical_url: str = "https://example.test/articles/one",
+    published_at: str = "2026-08-11T10:00:00+00:00",
+) -> ArticleInput:
     return ArticleInput(
         guid=guid,
-        canonical_url="https://example.test/articles/one",
+        canonical_url=canonical_url,
         title="O'Reilly article",
         summary="Original summary",
         content=content,
         author="Author",
         categories=("technology",),
-        published_at="2026-08-11T10:00:00+00:00",
+        published_at=published_at,
     )
 
 
@@ -91,6 +97,44 @@ def test_reconcile_article_by_guid_or_link_updates_changed_content(database: Dat
     )
     assert same_link_without_guid.article.id == first.article.id
     assert same_link_without_guid.content_changed is True
+
+
+def test_list_articles_overview_filters_by_source_and_status(database: Database) -> None:
+    feed = database.upsert_feed(_feed())
+    reconciled = database.reconcile_article(feed.id, _article())
+    article = reconciled.article
+    database.save_translation(
+        TranslationInput(
+            article_id=article.id,
+            target_language="zh-CN",
+            title="中文标题",
+            summary=None,
+            content=None,
+            provider_name="google",
+            provider_model=None,
+            status="succeeded",
+            source_hash=article.content_hash,
+        )
+    )
+
+    overviews = database.list_articles_overview(target_language="zh-CN")
+    assert len(overviews) == 1
+    row = overviews[0]
+    assert row.feed_name == "Example feed"
+    assert row.translation_status == "succeeded"
+    assert row.translation_provider == "google"
+    assert row.extraction_status is None
+
+    # published_after excludes an earlier article timestamp.
+    late = database.reconcile_article(
+        feed.id,
+        _article(guid="article-2", canonical_url="https://example.test/articles/two",
+                 published_at="2026-08-12T10:00:00+00:00"),
+    )
+    overviews = database.list_articles_overview(
+        target_language="zh-CN", published_after="2026-08-12T00:00:00+00:00"
+    )
+    assert [row.article.id for row in overviews] == [late.article.id]
 
 
 def test_processing_results_and_export_run_are_persisted(database: Database) -> None:

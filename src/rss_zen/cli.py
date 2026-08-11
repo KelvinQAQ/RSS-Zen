@@ -1,7 +1,10 @@
 """Command-line entry points for RSS-Zen."""
 
+import json
+import re
 import signal
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -57,6 +60,30 @@ def _install_shutdown_handlers(stop: Callable[[], None]) -> dict[int, object]:
 def _restore_signal_handlers(previous: dict[int, object]) -> None:
     for signal_number, handler in previous.items():
         signal.signal(signal_number, handler)
+
+
+_DURATION_RE = re.compile(r"^(\d+)\s*([hdw])$", re.IGNORECASE)
+
+
+def _parse_time_bound(value: str | None) -> str | None:
+    """Parse a time bound as either ISO 8601 or a relative duration (e.g. 2d, 12h, 1w)."""
+    if value is None:
+        return None
+    match = _DURATION_RE.match(value.strip())
+    if match:
+        amount = int(match.group(1))
+        unit = match.group(2).lower()
+        delta = {
+            "h": timedelta(hours=amount),
+            "d": timedelta(days=amount),
+            "w": timedelta(weeks=amount),
+        }[unit]
+        return (datetime.now(UTC) - delta).isoformat()
+    return value
+
+
+def _json_echo(payload: object) -> None:
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
 
 
 @app.command()
@@ -291,9 +318,90 @@ def extract(
         raise typer.Exit(code=1)
 
 
+@app.command("list")
+def list_articles(
+    source: str | None = typer.Option(None, "--source", "-s", help="Filter by feed name or URL."),
+    since: str | None = typer.Option(
+        None,
+        "--since",
+        help="Filter articles published since: a duration (2d, 12h, 1w) or ISO datetime.",
+    ),
+    until: str | None = typer.Option(
+        None,
+        "--until",
+        help="Filter articles published before: a duration or ISO datetime.",
+    ),
+    status_filter: str | None = typer.Option(
+        None, "--status", help="Filter by translation status (succeeded, failed, pending)."
+    ),
+    limit: int = typer.Option(50, "--limit", "-n", min=1, max=1000, help="Max articles to list."),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+    config_path: Path = typer.Option(Path("rss-zen.toml"), "--config", "-c"),
+) -> None:
+    """List articles with their translation/extraction status."""
+    try:
+        database, config = _database_from_config(config_path)
+        published_after = _parse_time_bound(since)
+        published_before = _parse_time_bound(until)
+        overviews = database.list_articles_overview(
+            target_language=config.translation.target_language,
+            source=source,
+            published_after=published_after,
+            published_before=published_before,
+            translation_status=status_filter,
+            limit=limit,
+        )
+    except AppError as error:
+        _handle_app_error(error)
+        return
+
+    if json_output:
+        _json_echo(
+            [
+                {
+                    "id": row.article.id,
+                    "feed": row.feed_name,
+                    "title": row.article.title,
+                    "published_at": row.article.published_at,
+                    "url": row.article.canonical_url,
+                    "translation_status": row.translation_status,
+                    "translation_provider": row.translation_provider,
+                    "extraction_status": row.extraction_status,
+                }
+                for row in overviews
+            ]
+        )
+        return
+
+    for row in overviews:
+        article = row.article
+        typer.echo(
+            " ".join(
+                part
+                for part in [
+                    f"id={article.id}",
+                    f"published={article.published_at or '-'}",
+                    f"translation={row.translation_status or 'pending'}",
+                    f"extraction={row.extraction_status or 'not_requested'}",
+                    f"title={article.title}",
+                ]
+            )
+        )
+
+
 @app.command("export")
 def export_articles(
     profile_name: str = typer.Argument(...),
+    since: str | None = typer.Option(
+        None,
+        "--since",
+        help="Only articles published since: a duration (2d, 12h, 1w) or ISO datetime.",
+    ),
+    until: str | None = typer.Option(
+        None,
+        "--until",
+        help="Only articles published before: a duration or ISO datetime.",
+    ),
     config_path: Path = typer.Option(Path("rss-zen.toml"), "--config", "-c"),
 ) -> None:
     """Export articles using a named Markdown profile."""
@@ -305,6 +413,20 @@ def export_articles(
         output_path = profile.output_path
         if not output_path.is_absolute():
             profile = profile.model_copy(update={"output_path": config_path.parent / output_path})
+        # CLI --since/--until override the profile's published filters without editing config.
+        published_after = _parse_time_bound(since) or profile.filters.published_after
+        published_before = _parse_time_bound(until) or profile.filters.published_before
+        if published_after is not None or published_before is not None:
+            profile = profile.model_copy(
+                update={
+                    "filters": profile.filters.model_copy(
+                        update={
+                            "published_after": published_after,
+                            "published_before": published_before,
+                        }
+                    )
+                }
+            )
         result = MarkdownExporter(
             database, target_language=config.translation.target_language
         ).export_profile(profile)
@@ -341,6 +463,7 @@ def backup(
 @app.command()
 def status(
     config_path: Path = typer.Option(Path("rss-zen.toml"), "--config", "-c"),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
     """Show feed and processing status."""
     try:
@@ -350,6 +473,38 @@ def status(
         errors = database.processing_error_counts(config.translation.target_language)
     except AppError as error:
         _handle_app_error(error)
+        return
+    if json_output:
+        _json_echo(
+            {
+                "counts": {
+                    "articles": counts.article_count,
+                    "pending_translation": counts.pending_translation_count,
+                    "failed_translation": counts.failed_translation_count,
+                    "terminal_translation": counts.terminal_translation_count,
+                    "failed_extraction": counts.failed_extraction_count,
+                },
+                "feeds": [
+                    {
+                        "id": feed.id,
+                        "name": feed.name,
+                        "enabled": feed.enabled,
+                        "url": feed.url,
+                        "last_success": feed.last_success_at,
+                        "last_error": feed.last_error_code,
+                    }
+                    for feed in database.list_feeds()
+                ],
+                "errors": [
+                    {
+                        "workflow": error.workflow,
+                        "error_code": error.error_code,
+                        "count": error.count,
+                    }
+                    for error in errors
+                ],
+            }
+        )
         return
     typer.echo(
         " ".join(

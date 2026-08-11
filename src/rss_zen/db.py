@@ -192,6 +192,17 @@ class ExportArticleRecord:
 
 
 @dataclass(frozen=True)
+class ArticleOverview:
+    """Article plus its latest translation/extraction status for the list command."""
+
+    article: ArticleRecord
+    feed_name: str
+    translation_status: str | None
+    translation_provider: str | None
+    extraction_status: str | None
+
+
+@dataclass(frozen=True)
 class ProcessingCounts:
     """Local processing counts for the status command."""
 
@@ -572,6 +583,67 @@ class Database:
         with self._connection() as connection:
             rows = connection.execute(query, parameters).fetchall()
         return [_article_from_row(row) for row in rows]
+
+    def list_articles_overview(
+        self,
+        *,
+        target_language: str,
+        source: str | None = None,
+        published_after: str | None = None,
+        published_before: str | None = None,
+        translation_status: str | None = None,
+        limit: int | None = None,
+    ) -> list[ArticleOverview]:
+        """Return articles with their latest translation/extraction status."""
+        conditions: list[str] = []
+        parameters: list[object] = []
+        if source is not None:
+            conditions.append("(feeds.name = ? OR feeds.url = ?)")
+            parameters.extend((source, source))
+        if published_after is not None:
+            conditions.append("articles.published_at >= ?")
+            parameters.append(published_after)
+        if published_before is not None:
+            conditions.append("articles.published_at <= ?")
+            parameters.append(published_before)
+        if translation_status is not None:
+            conditions.append("COALESCE(translations.status, '') = ?")
+            parameters.append(translation_status)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        limit_clause = " LIMIT ?" if limit else ""
+        if limit:
+            parameters.append(limit)
+        query = f"""
+            SELECT
+                articles.*,
+                feeds.name AS overview_feed_name,
+                translations.status AS overview_translation_status,
+                translations.provider_name AS overview_translation_provider,
+                (
+                    SELECT latest.status FROM extractions AS latest
+                    WHERE latest.article_id = articles.id
+                    ORDER BY latest.id DESC LIMIT 1
+                ) AS overview_extraction_status
+            FROM articles
+            JOIN feeds ON feeds.id = articles.feed_id
+            LEFT JOIN translations ON translations.article_id = articles.id
+                AND translations.target_language = ?
+            {where}
+            ORDER BY articles.published_at DESC, articles.id DESC
+            {limit_clause}
+        """
+        with self._connection() as connection:
+            rows = connection.execute(query, [target_language, *parameters]).fetchall()
+        return [
+            ArticleOverview(
+                article=_article_from_row(row),
+                feed_name=str(row["overview_feed_name"]),
+                translation_status=row["overview_translation_status"],
+                translation_provider=row["overview_translation_provider"],
+                extraction_status=row["overview_extraction_status"],
+            )
+            for row in rows
+        ]
 
     def update_article_languages(
         self, article_id: int, *, detected_language: str | None, source_language: str | None

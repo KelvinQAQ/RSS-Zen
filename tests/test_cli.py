@@ -69,3 +69,65 @@ model = "translation-model"
     assert status.exit_code == 0
     assert "articles=0" in status.stdout
     assert "url=https://example.test/feed.xml" in status.stdout
+
+
+def test_status_json_output(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("FREE_TRANSLATION_API_KEY", "free-secret")
+    config_path = tmp_path / "rss-zen.toml"
+    config_path.write_text(
+        """
+[database]
+path = "rss-zen.sqlite3"
+
+[translation]
+target_language = "zh-CN"
+
+[[translation.providers]]
+name = "free"
+kind = "libretranslate"
+endpoint = "https://translate.example.test/translate"
+api_key_env = "FREE_TRANSLATION_API_KEY"
+""",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["status", "--json", "--config", str(config_path)])
+
+    assert result.exit_code == 0
+    import json as _json
+
+    payload = _json.loads(result.stdout)
+    assert payload["counts"]["articles"] == 0
+    assert payload["feeds"] == []
+    assert payload["errors"] == []
+
+
+def test_list_command_runs(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("FREE_TRANSLATION_API_KEY", "free-secret")
+    config_path = tmp_path / "rss-zen.toml"
+    config_path.write_text(
+        """
+[database]
+path = "rss-zen.sqlite3"
+
+[translation]
+target_language = "zh-CN"
+
+[[translation.providers]]
+name = "free"
+kind = "libretranslate"
+endpoint = "https://translate.example.test/translate"
+api_key_env = "FREE_TRANSLATION_API_KEY"
+
+[[feeds]]
+name = "Example"
+url = "https://example.test/feed.xml"
+""",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["list", "--config", str(config_path)])
+
+    assert result.exit_code == 0
+    # No articles yet, so output is empty but the command succeeds.
+    assert result.stdout == ""

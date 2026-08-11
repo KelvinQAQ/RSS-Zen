@@ -69,10 +69,20 @@ uv run rss-zen extract --article-id 42 --config rss-zen.toml
 uv run rss-zen extract --source "Example feed" --without-extraction --config rss-zen.toml
 
 # Render a named Markdown profile.
+# --since/--until override the profile's time filters without editing config.
+# Accept a relative duration (2d, 12h, 1w) or an ISO datetime.
 uv run rss-zen export daily --config rss-zen.toml
+uv run rss-zen export daily --since 2d --config rss-zen.toml
+
+# List articles with their translation/extraction status.
+# Filters: --source, --since, --until, --status (succeeded/failed/pending), --limit.
+uv run rss-zen list --since 2d --config rss-zen.toml
+uv run rss-zen list --source "Example feed" --status succeeded --limit 20 --config rss-zen.toml
 
 # Inspect local feed and processing state without network access.
+# --json emits machine-readable structured output.
 uv run rss-zen status --config rss-zen.toml
+uv run rss-zen status --json --config rss-zen.toml
 
 # Start the foreground polling service.
 uv run rss-zen serve --config rss-zen.toml --verbose
@@ -111,7 +121,10 @@ Each `[[exports]]` entry writes one Markdown file with a top-level directory and
 stable `article-<id>` anchors. `fields` chooses output fields; `content_fallback`
 controls the order of full-text, RSS-body, and summary content. `filters` and
 `preprocess` are declarative only: no shell commands or arbitrary code run during
-export.
+export. The `list` command reports each article's translation/extraction status and
+supports `--since`/`--until`/`--status` filtering plus `--json` for machine-readable
+output. The `export` command's `--since`/`--until` options override the profile's
+`published_after`/`published_before` filters without editing the config.
 
 ```toml
 [[exports]]
