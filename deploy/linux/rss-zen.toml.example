@@ -1,0 +1,56 @@
+# Generated as /etc/rss-zen/rss-zen.toml by scripts/deploy-linux.sh.
+# Replace every replace-me value before services can start.
+
+[database]
+path = "/var/lib/rss-zen/rss-zen.sqlite3"
+
+[service]
+default_poll_interval_minutes = 30
+translation_retry_interval_minutes = 5
+translation_max_attempts = 5
+retry_max_backoff_minutes = 360
+
+[limits]
+max_feed_response_bytes = 10000000
+max_entries_per_feed = 500
+max_article_chars = 500000
+max_translation_chars = 100000
+
+[translation]
+target_language = "zh-CN"
+
+[[translation.providers]]
+name = "replace-me-provider"
+kind = "openai_compatible"
+endpoint = "https://replace-me.invalid/v1"
+api_key_env = "AI_TRANSLATION_API_KEY"
+model = "replace-me-model"
+
+[anysearch]
+base_url = "https://api.anysearch.com"
+tag = "general.general"
+zone = "intl"
+language = "zh-CN"
+max_results = 3
+
+# Add one or more HTTPS feeds after completing provider configuration.
+# [[feeds]]
+# name = "Example feed"
+# url = "https://feeds.example.com/rss.xml"
+# categories = ["technology"]
+# poll_interval_minutes = 30
+# language = "en"
+
+[[exports]]
+name = "daily"
+output_path = "/var/lib/rss-zen/exports/daily.md"
+title = "Daily reading"
+fields = ["source_name", "published_at", "url", "content"]
+content_fallback = ["full_text", "rss_content", "summary"]
+
+[exports.filters]
+translation_status = "succeeded"
+
+[[exports.preprocess]]
+field = "content"
+operation = "strip_html"

@@ -1,0 +1,291 @@
+"""Typed configuration and domain models."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Literal
+from urllib.parse import urlparse
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+class DatabaseSettings(BaseModel):
+    """SQLite storage location."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: Path
+
+    @field_validator("path")
+    @classmethod
+    def _path_must_not_be_empty(cls, value: Path) -> Path:
+        if not str(value).strip() or str(value) == ".":
+            raise ValueError("database path must not be empty")
+        return value
+
+
+class ServiceSettings(BaseModel):
+    """Long-running service defaults and bounded retry policy."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    default_poll_interval_minutes: int = Field(default=30, ge=1)
+    translation_retry_interval_minutes: int = Field(default=5, ge=1)
+    translation_max_attempts: int = Field(default=5, ge=1)
+    retry_max_backoff_minutes: int = Field(default=360, ge=1)
+
+
+class LimitsSettings(BaseModel):
+    """Resource limits for untrusted feeds and provider requests."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_feed_response_bytes: int = Field(default=10_000_000, ge=1)
+    max_entries_per_feed: int = Field(default=500, ge=1)
+    max_article_chars: int = Field(default=500_000, ge=1)
+    max_translation_chars: int = Field(default=100_000, ge=1)
+
+
+class TranslationProviderConfig(BaseModel):
+    """One translation backend in priority order."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1)
+    kind: str
+    endpoint: str
+    api_key_env: str | None = None
+    api_key: str | None = Field(default=None, exclude=True, repr=False)
+    model: str | None = None
+    reasoning_effort: str | None = Field(
+        default=None,
+        description=(
+            "Optional reasoning effort sent to OpenAI-compatible providers "
+            "(for example 'none', 'low', 'medium', 'high'); omitted when unset."
+        ),
+    )
+    timeout_seconds: float | None = Field(
+        default=None,
+        gt=0,
+        description="Optional per-request timeout override for this provider.",
+    )
+    max_chars: int | None = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Optional character limit per request for OpenAI-compatible providers; "
+            "long text is split into chunks. Defaults to 4000 when unset."
+        ),
+    )
+
+    @field_validator("kind")
+    @classmethod
+    def _supported_kind(cls, value: str) -> str:
+        supported = {"libretranslate", "mymemory", "openai_compatible"}
+        if value not in supported:
+            raise ValueError(f"unsupported translation provider kind: {value}")
+        return value
+
+    @field_validator("endpoint")
+    @classmethod
+    def _https_endpoint(cls, value: str) -> str:
+        parsed = urlparse(value)
+        if parsed.scheme != "https" or not parsed.netloc:
+            raise ValueError("endpoint must use HTTPS")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("endpoint must not include URL credentials")
+        return value.rstrip("/")
+
+    @model_validator(mode="after")
+    def _openai_provider_needs_model(self) -> TranslationProviderConfig:
+        if self.kind == "openai_compatible" and not self.model:
+            raise ValueError("openai_compatible providers require a model")
+        return self
+
+
+class TranslationSettings(BaseModel):
+    """Translation target and ordered provider chain."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    target_language: str = "zh-CN"
+    providers: list[TranslationProviderConfig] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _provider_names_are_unique(self) -> TranslationSettings:
+        names = [provider.name.casefold() for provider in self.providers]
+        if len(names) != len(set(names)):
+            raise ValueError("translation provider names must be unique")
+        return self
+
+
+class AnySearchSettings(BaseModel):
+    """Documented AnySearch `/v1/search` configuration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    base_url: str = "https://api.anysearch.com"
+    api_key_env: str | None = None
+    api_key: str | None = Field(default=None, exclude=True, repr=False)
+    tag: str = "general.general"
+    zone: str | None = None
+    language: str | None = None
+    max_results: int = Field(default=3, ge=1, le=10)
+
+    @field_validator("base_url")
+    @classmethod
+    def _valid_base_url(cls, value: str) -> str:
+        parsed = urlparse(value)
+        if parsed.scheme != "https" or not parsed.netloc:
+            raise ValueError("AnySearch base_url must be HTTPS")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("AnySearch base_url must not include URL credentials")
+        return value.rstrip("/")
+
+    @field_validator("tag")
+    @classmethod
+    def _valid_tag(cls, value: str) -> str:
+        if "." not in value or value.startswith(".") or value.endswith("."):
+            raise ValueError("AnySearch tag must use domain.sub_domain form")
+        return value
+
+    @field_validator("zone")
+    @classmethod
+    def _valid_zone(cls, value: str | None) -> str | None:
+        if value is not None and value not in {"cn", "intl"}:
+            raise ValueError("AnySearch zone must be cn or intl")
+        return value
+
+
+class FeedConfig(BaseModel):
+    """One configured RSS or Atom feed."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1)
+    url: str
+    categories: list[str] = Field(default_factory=list)
+    poll_interval_minutes: int | None = Field(default=None, ge=1)
+    language: str | None = None
+    enabled: bool = True
+
+    @field_validator("url")
+    @classmethod
+    def _https_feed_url(cls, value: str) -> str:
+        parsed = urlparse(value)
+        if parsed.scheme != "https" or not parsed.netloc:
+            raise ValueError("feed URL must use HTTPS")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("feed URL must not include URL credentials")
+        return value
+
+
+class ExportProfile(BaseModel):
+    """A named Markdown export definition."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1)
+    output_path: Path
+    title: str = Field(min_length=1)
+    fields: list[str] = Field(
+        default_factory=lambda: ["source_name", "published_at", "url", "content"]
+    )
+    content_fallback: list[str] = Field(
+        default_factory=lambda: ["full_text", "rss_content", "summary"]
+    )
+    filters: ExportFilters = Field(default_factory=lambda: ExportFilters())
+    preprocess: list[PreprocessStep] = Field(default_factory=list)
+    sort_by: Literal["published_at", "first_seen_at"] = "published_at"
+    sort_descending: bool = True
+
+    @field_validator("fields")
+    @classmethod
+    def _supported_fields(cls, values: list[str]) -> list[str]:
+        supported = {
+            "title",
+            "summary",
+            "content",
+            "source_name",
+            "published_at",
+            "author",
+            "categories",
+            "url",
+            "source_language",
+            "extraction_status",
+        }
+        unknown = set(values) - supported
+        if unknown:
+            raise ValueError(f"unsupported export fields: {', '.join(sorted(unknown))}")
+        return values
+
+    @field_validator("content_fallback")
+    @classmethod
+    def _supported_content_fallback(cls, values: list[str]) -> list[str]:
+        supported = {"full_text", "rss_content", "summary"}
+        if not values or set(values) - supported:
+            raise ValueError("content_fallback must use full_text, rss_content, or summary")
+        return values
+
+
+class ExportFilters(BaseModel):
+    """Safe article selectors embedded in an export profile."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sources: list[str] = Field(default_factory=list)
+    categories: list[str] = Field(default_factory=list)
+    published_after: str | None = None
+    published_before: str | None = None
+    translation_status: str = "succeeded"
+    require_full_text: bool = False
+
+
+class PreprocessStep(BaseModel):
+    """A restricted, declarative transformation for one rendered field."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    field: str
+    operation: Literal["strip_html", "collapse_whitespace", "truncate", "replace", "date_format"]
+    find: str | None = None
+    replacement: str | None = None
+    max_length: int | None = Field(default=None, ge=1)
+    format: str | None = None
+
+    @model_validator(mode="after")
+    def _operation_arguments(self) -> PreprocessStep:
+        if self.operation == "replace" and self.find is None:
+            raise ValueError("replace preprocessing requires find")
+        if self.operation == "truncate" and self.max_length is None:
+            raise ValueError("truncate preprocessing requires max_length")
+        if self.operation == "date_format" and self.format is None:
+            raise ValueError("date_format preprocessing requires format")
+        return self
+
+
+class AppConfig(BaseModel):
+    """Complete application configuration after secret resolution."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    database: DatabaseSettings
+    service: ServiceSettings = Field(default_factory=ServiceSettings)
+    limits: LimitsSettings = Field(default_factory=LimitsSettings)
+    translation: TranslationSettings
+    anysearch: AnySearchSettings = Field(default_factory=AnySearchSettings)
+    feeds: list[FeedConfig] = Field(default_factory=list)
+    exports: list[ExportProfile] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _export_names_are_unique(self) -> AppConfig:
+        names = [profile.name.casefold() for profile in self.exports]
+        if len(names) != len(set(names)):
+            raise ValueError("duplicate export profile names are not allowed")
+        return self
+
+    def effective_source_language(
+        self, feed: FeedConfig, detected_language: str | None
+    ) -> str | None:
+        """Prefer an explicit feed language to automatic detection."""
+        return feed.language or detected_language

@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Root-owned, fixed-action bridge for the rss-zen-deploy account.
+# No user-controlled command, unit name, or argument is accepted.
+set -Eeuo pipefail
+
+readonly SYSTEMCTL="/usr/bin/systemctl"
+readonly EXPECTED_USER="rss-zen-deploy"
+
+if [[ "${1:-}" == "--self-check" ]]; then
+  exit 0
+fi
+
+[[ "${SUDO_USER:-}" == "${EXPECTED_USER}" ]] || {
+  printf 'rss-zen-deploy-control: unexpected caller\n' >&2
+  exit 1
+}
+
+case "${1:-}" in
+  activate)
+    exec "${SYSTEMCTL}" enable --now \
+      rss-zen.service rss-zen-export-daily.timer rss-zen-backup.timer
+    ;;
+  restart)
+    exec "${SYSTEMCTL}" restart rss-zen.service
+    ;;
+  status)
+    exec "${SYSTEMCTL}" status rss-zen.service
+    ;;
+  is-active)
+    exec "${SYSTEMCTL}" is-active rss-zen.service
+    ;;
+  *)
+    printf 'usage: %s {activate|restart|status|is-active}\n' "$0" >&2
+    exit 2
+    ;;
+esac

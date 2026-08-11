@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Example Atom</title>
+  <id>https://example.test/atom.xml</id>
+  <updated>2026-08-11T10:00:00Z</updated>
+  <entry>
+    <id>atom-item-1</id>
+    <title>Atom article</title>
+    <link href="https://example.test/articles/atom" />
+    <summary>Atom summary</summary>
+    <content type="html">&lt;p&gt;Atom full body&lt;/p&gt;</content>
+    <author><name>Atom author</name></author>
+    <category term="News" />
+    <published>2026-08-11T10:00:00Z</published>
+    <updated>2026-08-11T11:00:00Z</updated>
+  </entry>
+</feed>

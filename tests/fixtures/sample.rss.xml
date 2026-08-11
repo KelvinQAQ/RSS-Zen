@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Example RSS</title>
+    <link>https://example.test/</link>
+    <description>Fixture feed</description>
+    <item>
+      <guid>rss-item-1</guid>
+      <title>First article</title>
+      <link>/articles/first</link>
+      <description><![CDATA[<p>First summary</p>]]></description>
+      <category>Technology</category>
+      <pubDate>Mon, 11 Aug 2026 10:00:00 +0000</pubDate>
+    </item>
+  </channel>
+</rss>

@@ -1,0 +1,46 @@
+[Unit]
+Description=RSS-Zen RSS synchronization and translation service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=rss-zen
+Group=rss-zen
+WorkingDirectory=/var/lib/rss-zen
+LoadCredential=rss-zen.env:/etc/rss-zen/rss-zen.env
+EnvironmentFile=%d/rss-zen.env
+ExecStart=/opt/rss-zen/current/.venv/bin/rss-zen serve --config /etc/rss-zen/rss-zen.toml
+Restart=on-failure
+RestartSec=15s
+TimeoutStopSec=120s
+UMask=0077
+StateDirectory=rss-zen
+RuntimeDirectory=rss-zen
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/rss-zen
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

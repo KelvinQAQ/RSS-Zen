@@ -1,0 +1,10 @@
+[Unit]
+Description=Scheduled RSS-Zen Markdown export (daily)
+
+[Timer]
+OnCalendar=*-*-* 06:15:00
+Persistent=true
+Unit=rss-zen-export@daily.service
+
+[Install]
+WantedBy=timers.target

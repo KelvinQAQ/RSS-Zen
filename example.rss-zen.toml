@@ -1,0 +1,62 @@
+[database]
+path = "data/rss-zen.sqlite3"
+
+[service]
+default_poll_interval_minutes = 30
+translation_retry_interval_minutes = 5
+translation_max_attempts = 5
+retry_max_backoff_minutes = 360
+
+[limits]
+max_feed_response_bytes = 10000000
+max_entries_per_feed = 500
+max_article_chars = 500000
+max_translation_chars = 100000
+
+[translation]
+target_language = "zh-CN"
+
+[[translation.providers]]
+name = "free"
+kind = "libretranslate"
+endpoint = "https://translate.example.invalid/translate"
+api_key_env = "FREE_TRANSLATION_API_KEY"
+
+[[translation.providers]]
+name = "ai"
+kind = "openai_compatible"
+endpoint = "https://api.openai.com/v1"
+api_key_env = "AI_TRANSLATION_API_KEY"
+model = "gpt-4.1-mini"
+# reasoning_effort = "none"  # uncomment to disable model thinking
+# timeout_seconds = 120     # override the 30s client default per request
+# max_chars = 4000          # split longer content into per-request chunks
+
+[anysearch]
+base_url = "https://api.anysearch.com"
+api_key_env = "ANYSEARCH_API_KEY"
+tag = "general.general"
+zone = "intl"
+language = "zh-CN"
+max_results = 3
+
+[[feeds]]
+name = "Example feed"
+url = "https://example.invalid/rss.xml"
+categories = ["technology"]
+poll_interval_minutes = 15
+language = "en"
+
+[[exports]]
+name = "daily"
+output_path = "exports/daily.md"
+title = "Daily reading"
+fields = ["source_name", "published_at", "url", "content"]
+content_fallback = ["full_text", "rss_content", "summary"]
+
+[exports.filters]
+translation_status = "succeeded"
+
+[[exports.preprocess]]
+field = "content"
+operation = "strip_html"

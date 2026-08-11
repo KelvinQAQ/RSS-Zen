@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<opml version="2.0">
+  <head><title>Subscriptions</title></head>
+  <body>
+    <outline text="Technology">
+      <outline text="Python Weekly" title="Python Weekly" type="rss" xmlUrl="https://example.test/python.xml" />
+      <outline text="Nested">
+        <outline text="AI Digest" title="AI Digest" type="rss" xmlUrl="https://example.test/ai.xml" />
+      </outline>
+    </outline>
+    <outline text="A web link" type="html" htmlUrl="https://example.test" />
+    <outline text="Disabled feed" type="html" xmlUrl="https://example.test/not-rss.xml" />
+  </body>
+</opml>
