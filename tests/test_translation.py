@@ -389,3 +389,37 @@ def test_google_provider_requires_deep_translator(monkeypatch) -> None:
 
     with pytest.raises(TranslationProviderError, match="not installed"):
         provider.translate("Hello", None, "zh-CN")
+
+
+def test_google_provider_clamps_chunk_size_below_deep_translator_cap(monkeypatch) -> None:
+    """Chunks must stay strictly under deep_translator's 5000-char Google limit."""
+    import rss_zen.translation as translation_module
+
+    calls: list[str] = []
+
+    class FakeGoogle:
+        def __init__(self, source: str, target: str) -> None:
+            pass
+
+        def translate(self, text: str) -> str:
+            calls.append(text)
+            return text
+
+    monkeypatch.setattr(translation_module, "GoogleTranslator", FakeGoogle)
+    config = translation_module.TranslationProviderConfig(name="google", kind="google")
+    provider = translation_module.GoogleProvider(config)
+
+    # Exactly 5000 characters would trip deep_translator's ``len < 5000`` guard;
+    # the provider must split it into chunks of at most 4999 characters.
+    text = "a" * 5000
+    provider.translate(text, None, "zh-CN")
+
+    assert all(len(chunk) < 5000 for chunk in calls)
+    assert sum(len(chunk) for chunk in calls) == 5000
+
+    # An operator-configured max_chars above the hard cap is clamped too.
+    config = translation_module.TranslationProviderConfig(
+        name="google", kind="google", max_chars=9000
+    )
+    provider = translation_module.GoogleProvider(config)
+    assert provider._max_chars == 4999

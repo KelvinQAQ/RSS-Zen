@@ -174,6 +174,21 @@ class FeedConfig(BaseModel):
     poll_interval_minutes: int | None = Field(default=None, ge=1)
     language: str | None = None
     enabled: bool = True
+    headers: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Optional extra request headers sent when fetching this feed "
+            "(for example a custom User-Agent to satisfy publisher allowlists)."
+        ),
+    )
+    fetcher: Literal["auto", "curl"] = Field(
+        default="auto",
+        description=(
+            "'auto' uses the built-in HTTP client; 'curl' shells out to the system "
+            "curl binary for sources whose anti-bot layer fingerprints Python's "
+            "TLS client hello (for example Nitter RSS frontends)."
+        ),
+    )
 
     @field_validator("url")
     @classmethod

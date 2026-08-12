@@ -130,6 +130,8 @@ url = "https://example.invalid/rss.xml"
 categories = ["defense"]
 poll_interval_minutes = 15
 language = "en"
+# headers = { "User-Agent" = "FreshRSS/1.23.1 (Linux)" }   # 可选：自定义请求头
+# fetcher = "curl"  # 可选：改用系统 curl 抓取（反爬源用，见下）
 
 [[exports]]
 name = "daily"
@@ -140,10 +142,15 @@ content_fallback = ["full_text", "rss_content", "summary"]
 
 要点：
 - 翻译 provider 至少配置 1 个；`endpoint` 必须 HTTPS；`openai_compatible` 需要 `model`。
-- `google` kind 无需 endpoint 和 API key；长文本自动按 5000 字符分块。
+- `google` kind 无需 endpoint 和 API key；长文本自动按 5000 字符分块（实际 chunk 上限 4999，
+  低于 deep_translator 的严格 `len < 5000` 校验）。
 - 密钥通过环境变量注入（`api_key_env`），不写进配置文件/数据库。
 - 导出的 `translation_status` 过滤默认 `"succeeded"`——未翻译成功的文章不会出现在导出里（除非 profile 开了 `include_untranslated`）。
 - 导出 profile 支持关键词过滤（`keywords`/`content_keywords`）、标题去重（`dedupe_by=title` + `feed_priority`）。
+- **反爬源（Nitter/Twitter 账号 RSS）**：用 `fetcher = "curl"` + 自定义 UA。
+  `rss.xcancel.com/<handle>/rss` 按 UA 白名单放行（FreshRSS/TT-RSS 可过）且对 Python
+  TLS 指纹敏感，httpx 会被降级为占位 feed，必须走 curl 抓取器。轮询间隔建议 ≥60 分钟以
+   ️ 规避 429 限流。账号与官方 RSS 重复时以官方 RSS 为准（如 @DefenseNews↔Defense News 源）。
 
 ## 故障诊断
 

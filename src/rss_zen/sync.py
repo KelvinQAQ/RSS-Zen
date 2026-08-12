@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import calendar
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from urllib.parse import SplitResult, urljoin, urlsplit, urlunsplit
@@ -39,11 +40,15 @@ class FeedSyncService:
         translation_service: TranslationService | None = None,
         *,
         limits: LimitsSettings | None = None,
+        feed_headers: Mapping[str, Mapping[str, str]] | None = None,
+        curl_urls: set[str] | None = None,
     ) -> None:
         self._database = database
         self._http_client = http_client
         self._translation_service = translation_service
         self._limits = limits or LimitsSettings()
+        self._feed_headers = {url: dict(headers) for url, headers in (feed_headers or {}).items()}
+        self._curl_urls = set(curl_urls or ())
 
     def sync_all(self, feeds: list[FeedRecord]) -> list[FeedSyncResult]:
         """Synchronize all requested feeds, retaining a result for every feed."""
@@ -66,7 +71,11 @@ class FeedSyncService:
 
     def sync_feed(self, feed: FeedRecord) -> FeedSyncResult:
         """Fetch, parse, and reconcile one feed."""
-        response = self._http_client.get_feed(feed.url, _conditional_headers(feed))
+        headers = _conditional_headers(feed, self._feed_headers)
+        if feed.url in self._curl_urls:
+            response = self._http_client.get_feed_curl(feed.url, headers)
+        else:
+            response = self._http_client.get_feed(feed.url, headers)
         try:
             if response.status_code == 304:
                 self._database.record_feed_success(feed.id, etag=None, last_modified=None)
@@ -112,8 +121,11 @@ class FeedSyncService:
             response.close()
 
 
-def _conditional_headers(feed: FeedRecord) -> dict[str, str]:
+def _conditional_headers(
+    feed: FeedRecord, extra: Mapping[str, Mapping[str, str]] | None = None
+) -> dict[str, str]:
     headers = {"Accept": "application/atom+xml, application/rss+xml, application/xml, text/xml"}
+    headers.update((extra or {}).get(feed.url, {}))
     if feed.etag:
         headers["If-None-Match"] = feed.etag
     if feed.last_modified:

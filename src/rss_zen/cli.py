@@ -17,7 +17,7 @@ from rss_zen.db import Database
 from rss_zen.errors import AppError, ConfigurationError
 from rss_zen.export import MarkdownExporter
 from rss_zen.extraction import AnySearchExtractor, ExtractionService
-from rss_zen.feeds import import_opml_file, reconcile_config_feeds
+from rss_zen.feeds import import_opml_file, normalize_feed_url, reconcile_config_feeds
 from rss_zen.http_client import FeedHttpClient
 from rss_zen.logging import configure_logging
 from rss_zen.models import AppConfig
@@ -132,6 +132,8 @@ def serve(
                     ),
                     translator,
                     limits=config.limits,
+                    feed_headers=_config_feed_headers(config),
+                    curl_urls=_config_curl_urls(config),
                 )
                 scheduler = FeedScheduler(
                     database,
@@ -160,7 +162,7 @@ def sync(
     try:
         database, config = _database_from_config(config_path)
         reconcile_config_feeds(database, config.feeds)
-        feeds = database.list_feeds()
+        feeds = [feed for feed in database.list_feeds() if feed.enabled]
         if source is not None:
             feeds = [feed for feed in feeds if source in {feed.name, feed.url}]
         if not feeds:
@@ -182,6 +184,8 @@ def sync(
                 ),
                 translator,
                 limits=config.limits,
+                feed_headers=_config_feed_headers(config),
+                curl_urls=_config_curl_urls(config),
             ).sync_all(feeds)
     except AppError as error:
         _handle_app_error(error)
@@ -751,3 +755,17 @@ def status(
         )
     for error in errors:
         typer.echo(f"{error.workflow}_error={error.error_code} count={error.count}")
+
+
+def _config_feed_headers(config: AppConfig) -> dict[str, dict[str, str]]:
+    """Index per-feed custom request headers by normalized feed URL."""
+    return {
+        normalize_feed_url(feed.url): dict(feed.headers)
+        for feed in config.feeds
+        if feed.headers
+    }
+
+
+def _config_curl_urls(config: AppConfig) -> set[str]:
+    """Collect normalized feed URLs whose fetcher uses the system curl binary."""
+    return {normalize_feed_url(feed.url) for feed in config.feeds if feed.fetcher == "curl"}

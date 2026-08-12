@@ -51,6 +51,115 @@ def test_sync_uses_conditional_headers_and_handles_not_modified(tmp_path: Path) 
     assert requests[1].headers["if-modified-since"] == "Mon, 11 Aug 2026 10:00:00 GMT"
 
 
+def test_sync_sends_per_feed_custom_headers(tmp_path: Path) -> None:
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, content=_fixture("sample.rss.xml"))
+
+    database = Database(tmp_path / "rss-zen.sqlite3")
+    database.initialize()
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    http_client = FeedHttpClient(client, max_attempts=2, sleep=lambda _: None)
+    service = FeedSyncService(
+        database,
+        http_client,
+        feed_headers={
+            "https://example.test/feed.xml": {"User-Agent": "FreshRSS/1.23.1 (Linux)"}
+        },
+    )
+    feed = database.upsert_feed(FeedInput(name="RSS", url="https://example.test/feed.xml"))
+
+    service.sync_feed(feed)
+
+    assert captured[0].headers["user-agent"] == "FreshRSS/1.23.1 (Linux)"
+    assert captured[0].headers["accept"].startswith("application/atom+xml")
+
+
+def test_sync_uses_curl_fetcher_for_flagged_urls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess
+
+    import rss_zen.http_client as http_client_module
+
+    def fake_curl(command: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+        body_path = Path(command[command.index("-o") + 1])
+        header_path = Path(command[command.index("-D") + 1])
+        body_path.write_bytes(_fixture("sample.rss.xml"))
+        header_path.write_text(
+            "HTTP/1.1 200 OK\r\nETag: \"v2\"\r\nContent-Type: application/rss+xml\r\n\r\n"
+        )
+        return subprocess.CompletedProcess(command, 0, stdout=b"200", stderr=b"")
+
+    monkeypatch.setattr(http_client_module.subprocess, "run", fake_curl)
+
+    database = Database(tmp_path / "rss-zen.sqlite3")
+    database.initialize()
+    client = httpx.Client(transport=httpx.MockTransport(lambda _: httpx.Response(500)))
+    service = FeedSyncService(
+        database,
+        FeedHttpClient(client, max_attempts=2, sleep=lambda _: None),
+        curl_urls={"https://example.test/feed.xml"},
+    )
+    feed = database.upsert_feed(FeedInput(name="RSS", url="https://example.test/feed.xml"))
+
+    result = service.sync_feed(feed)
+
+    assert result.created_articles == 1
+    assert result.article_ids
+    assert database.get_feed_by_url(feed.url).etag == '"v2"'
+
+
+def test_curl_fetcher_retries_transient_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess
+
+    import rss_zen.http_client as http_client_module
+
+    calls: list[list[str]] = []
+
+    def fake_curl(command: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+        calls.append(command)
+        body_path = Path(command[command.index("-o") + 1])
+        header_path = Path(command[command.index("-D") + 1])
+        body_path.write_bytes(_fixture("sample.rss.xml"))
+        header_path.write_text("HTTP/1.1 200 OK\r\n\r\n")
+        return subprocess.CompletedProcess(command, 0, stdout=b"503", stderr=b"")
+
+    monkeypatch.setattr(http_client_module.subprocess, "run", fake_curl)
+
+    database = Database(tmp_path / "rss-zen.sqlite3")
+    database.initialize()
+    client = httpx.Client(transport=httpx.MockTransport(lambda _: httpx.Response(500)))
+    service = FeedSyncService(
+        database,
+        FeedHttpClient(client, max_attempts=2, sleep=lambda _: None),
+        curl_urls={"https://example.test/feed.xml"},
+    )
+    feed = database.upsert_feed(FeedInput(name="RSS", url="https://example.test/feed.xml"))
+
+    with pytest.raises(AppError) as excinfo:
+        service.sync_feed(feed)
+
+    assert excinfo.value.code == "feed_http_503"
+    assert len(calls) == 2
+
+
+def test_curl_fetcher_parses_final_redirect_headers(tmp_path: Path) -> None:
+    from rss_zen.http_client import _parse_curl_headers
+
+    raw = (
+        b"HTTP/1.1 302 Found\r\nLocation: /real/feed\r\n\r\n"
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/rss+xml\r\nETag: \"final\"\r\n\r\n"
+    )
+    headers = _parse_curl_headers(raw)
+    assert headers["etag"] == '"final"'
+    assert headers["content-type"] == "application/rss+xml"
+
+
 def test_sync_decodes_gzip_encoded_feed(tmp_path: Path) -> None:
     import gzip
 

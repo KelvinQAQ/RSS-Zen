@@ -257,12 +257,18 @@ class GoogleProvider:
     """
 
     _default_max_chars = 5000
+    # deep_translator's GoogleTranslate validates ``len(text) < 5000`` (strict), so
+    # per-request chunks must stay below its hard cap even when a chunk is exactly
+    # 5000 characters or the operator overrides max_chars upward.
+    _hard_cap = 4999
 
     def __init__(self, config: TranslationProviderConfig) -> None:
         self.name = config.name
         self.model = None
         self._timeout = config.timeout_seconds
-        self._max_chars = config.max_chars or self._default_max_chars
+        self._max_chars = min(
+            config.max_chars or self._default_max_chars, self._hard_cap
+        )
 
     def translate(self, text: str, source_language: str | None, target_language: str) -> str:
         if GoogleTranslator is None:

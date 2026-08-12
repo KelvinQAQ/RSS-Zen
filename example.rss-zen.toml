@@ -53,6 +53,9 @@ url = "https://example.invalid/rss.xml"
 categories = ["technology"]
 poll_interval_minutes = 15
 language = "en"
+# headers = { "User-Agent" = "FreshRSS/1.23.1 (Linux)" }   # optional extra request headers
+# fetcher = "curl"  # optional: fetch via system curl for sources that fingerprint
+#                    # Python's TLS stack (e.g. Nitter RSS: rss.xcancel.com/<handle>/rss)
 
 [[exports]]
 name = "daily"
