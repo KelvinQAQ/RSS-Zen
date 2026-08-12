@@ -204,6 +204,20 @@ class ExportProfile(BaseModel):
     preprocess: list[PreprocessStep] = Field(default_factory=list)
     sort_by: Literal["published_at", "first_seen_at"] = "published_at"
     sort_descending: bool = True
+    dedupe_by: Literal["none", "title"] = Field(
+        default="none",
+        description=(
+            "When 'title', collapse articles whose normalized title is identical, "
+            "keeping the highest-priority feed (see feed_priority)."
+        ),
+    )
+    feed_priority: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Feed names ordered by preference for title-deduplication; feeds not "
+            "listed rank after all listed feeds."
+        ),
+    )
 
     @field_validator("fields")
     @classmethod
@@ -245,6 +259,37 @@ class ExportFilters(BaseModel):
     published_before: str | None = None
     translation_status: str = "succeeded"
     require_full_text: bool = False
+    keywords: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Relevance keywords matched against the article title and summary in "
+            "both the original and translated text. Empty disables relevance "
+            "filtering for those fields."
+        ),
+    )
+    content_keywords: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Stricter relevance keywords matched against the article body (original "
+            "and translated). Kept separate from keywords because broad terms such "
+            "as country names match passing mentions in full text; body matching "
+            "should use strong geographic terms only. Empty disables body matching."
+        ),
+    )
+    keyword_match: Literal["any", "all"] = Field(
+        default="any",
+        description=(
+            "Whether any keyword or all keywords must match within one field tier "
+            "to keep an article."
+        ),
+    )
+    include_untranslated: bool = Field(
+        default=False,
+        description=(
+            "Also include articles whose translation is pending or failed, falling "
+            "back to the original-language text for matching and rendering."
+        ),
+    )
 
 
 class PreprocessStep(BaseModel):

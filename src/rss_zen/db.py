@@ -860,12 +860,13 @@ class Database:
         self,
         *,
         target_language: str,
-        translation_status: str,
+        translation_status: str | None = "succeeded",
         sources: tuple[str, ...] = (),
         categories: tuple[str, ...] = (),
         published_after: str | None = None,
         published_before: str | None = None,
         require_full_text: bool = False,
+        include_untranslated: bool = False,
         sort_by: str = "published_at",
         sort_descending: bool = True,
     ) -> list[ExportArticleRecord]:
@@ -876,8 +877,12 @@ class Database:
         }.get(sort_by)
         if order_column is None:
             raise ValueError("unsupported export sort column")
-        conditions = ["translations.target_language = ?", "translations.status = ?"]
-        parameters: list[object] = [target_language, translation_status]
+        include_untranslated = include_untranslated or translation_status is None
+        conditions: list[str] = []
+        parameters: list[object] = []
+        if not include_untranslated:
+            conditions.append("translations.status = ?")
+            parameters.append(translation_status)
         if sources:
             placeholders = ", ".join("?" for _ in sources)
             conditions.append(f"(feeds.name IN ({placeholders}) OR feeds.url IN ({placeholders}))")
@@ -892,8 +897,9 @@ class Database:
         if require_full_text:
             conditions.append("extractions.id IS NOT NULL")
             conditions.append("extractions.translated_content IS NOT NULL")
-        where = " AND ".join(conditions)
+        where_sql = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         direction = "DESC" if sort_descending else "ASC"
+        join_kind = "LEFT JOIN" if include_untranslated else "JOIN"
         query = f"""
             SELECT
                 articles.*,
@@ -925,15 +931,17 @@ class Database:
                 extractions.error_message AS export_extraction_error_message
             FROM articles
             JOIN feeds ON feeds.id = articles.feed_id
-            JOIN translations ON translations.article_id = articles.id
+            {join_kind} translations ON translations.article_id = articles.id
+                AND translations.target_language = ?
             LEFT JOIN extractions ON extractions.id = (
                 SELECT latest.id FROM extractions AS latest
                 WHERE latest.article_id = articles.id
                 ORDER BY latest.id DESC LIMIT 1
             )
-            WHERE {where}
+            {where_sql}
             ORDER BY {order_column} {direction}, articles.id {direction}
         """
+        parameters.insert(0, target_language)
         with self._connection() as connection:
             rows = connection.execute(query, parameters).fetchall()
         records = [_export_article_from_row(row) for row in rows]
@@ -1250,23 +1258,42 @@ def _export_run_from_row(row: sqlite3.Row) -> ExportRunRecord:
 
 def _export_article_from_row(row: sqlite3.Row) -> ExportArticleRecord:
     article = _article_from_row(row)
-    translation = TranslationRecord(
-        article_id=article.id,
-        target_language=str(row["export_translation_target_language"]),
-        title=row["export_translation_title"],
-        summary=row["export_translation_summary"],
-        content=row["export_translation_content"],
-        provider_name=str(row["export_translation_provider_name"]),
-        provider_model=row["export_translation_provider_model"],
-        status=str(row["export_translation_status"]),
-        source_hash=str(row["export_translation_source_hash"]),
-        error_code=row["export_translation_error_code"],
-        error_message=row["export_translation_error_message"],
-        attempt_count=int(row["export_translation_attempt_count"]),
-        next_retry_at=row["export_translation_next_retry_at"],
-        last_attempt_at=row["export_translation_last_attempt_at"],
-        terminal=bool(row["export_translation_terminal"]),
-    )
+    if row["export_translation_status"] is None:
+        translation = TranslationRecord(
+            article_id=article.id,
+            target_language="",
+            title=None,
+            summary=None,
+            content=None,
+            provider_name="",
+            provider_model=None,
+            status="missing",
+            source_hash="",
+            error_code=None,
+            error_message=None,
+            attempt_count=0,
+            next_retry_at=None,
+            last_attempt_at=None,
+            terminal=False,
+        )
+    else:
+        translation = TranslationRecord(
+            article_id=article.id,
+            target_language=str(row["export_translation_target_language"]),
+            title=row["export_translation_title"],
+            summary=row["export_translation_summary"],
+            content=row["export_translation_content"],
+            provider_name=str(row["export_translation_provider_name"]),
+            provider_model=row["export_translation_provider_model"],
+            status=str(row["export_translation_status"]),
+            source_hash=str(row["export_translation_source_hash"]),
+            error_code=row["export_translation_error_code"],
+            error_message=row["export_translation_error_message"],
+            attempt_count=int(row["export_translation_attempt_count"]),
+            next_retry_at=row["export_translation_next_retry_at"],
+            last_attempt_at=row["export_translation_last_attempt_at"],
+            terminal=bool(row["export_translation_terminal"]),
+        )
     extraction = None
     if row["extraction_id"] is not None:
         extraction = ExtractionRecord(
