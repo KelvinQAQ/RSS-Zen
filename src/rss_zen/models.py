@@ -276,11 +276,13 @@ class ExportFilters(BaseModel):
             "should use strong geographic terms only. Empty disables body matching."
         ),
     )
-    keyword_match: Literal["any", "all"] = Field(
+    keyword_match: Literal["any", "all", "groups"] = Field(
         default="any",
         description=(
-            "Whether any keyword or all keywords must match within one field tier "
-            "to keep an article."
+            "How keyword tiers combine. 'any': a match in either tier keeps the "
+            "article. 'all': every keyword in both tiers must match. 'groups': "
+            "at least one keyword from each tier must match, combining a topic "
+            "tier (keywords) with a region/body tier (content_keywords)."
         ),
     )
     include_untranslated: bool = Field(

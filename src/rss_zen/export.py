@@ -54,7 +54,7 @@ class MarkdownExporter:
                 articles,
                 keywords=filters.keywords,
                 content_keywords=filters.content_keywords,
-                require_all=filters.keyword_match == "all",
+                match_mode=filters.keyword_match,
             )
         if profile.dedupe_by == "title":
             articles = _dedupe_by_title(
@@ -103,14 +103,29 @@ def _render_document(profile: ExportProfile, articles: list[ExportArticleRecord]
     return "\n".join(lines).rstrip() + "\n"
 
 
+_ERROR_PAGE_RE = re.compile(
+    r"Error\s+\d{3}|Server Error|That['’]s an error|Try again later", re.IGNORECASE
+)
+
+
+def _usable_text(value: str | None) -> str:
+    """Return the value unless it looks like a provider error page."""
+    text = value or ""
+    if _ERROR_PAGE_RE.search(text):
+        return ""
+    return text
+
+
 def _field_values(record: ExportArticleRecord, profile: ExportProfile) -> dict[str, str]:
     article = record.article
     translation = record.translation
     extraction = record.extraction
     translated = translation.status == "succeeded"
+    title = _usable_text(translation.title) if translated else ""
+    summary = _usable_text(translation.summary) if translated else ""
     return {
-        "title": (translation.title if translated else "") or article.title,
-        "summary": (translation.summary if translated else "") or "",
+        "title": title or article.title,
+        "summary": summary,
         "content": _content_value(record, profile.content_fallback),
         "source_name": record.feed_name,
         "published_at": article.published_at or "",
@@ -131,8 +146,10 @@ def _content_value(record: ExportArticleRecord, fallback: list[str]) -> str:
             return extraction.translated_content
         if source == "rss_content" and translated and translation.content:
             return translation.content
-        if source == "summary" and translated and translation.summary:
-            return translation.summary
+        if source == "summary" and translated:
+            summary = _usable_text(translation.summary)
+            if summary:
+                return summary
     # Fall back to the original-language source text when no translated text exists.
     if record.article.content:
         return record.article.content
@@ -144,42 +161,59 @@ def _filter_by_keywords(
     *,
     keywords: list[str],
     content_keywords: list[str],
-    require_all: bool,
+    match_mode: str = "any",
 ) -> list[ExportArticleRecord]:
     """Keep records whose title/summary or body matches the relevance keywords.
 
     ``keywords`` are matched against the title and summary (in both the original
     and translated text, falling back to the original when untranslated);
-    ``content_keywords`` are matched against the body text only. An article is
-    kept when a title/summary keyword matches, or when a body keyword matches, so
-    broad terms never scan the full body. ASCII keywords use word-boundary
-    matching so that e.g. "pla" does not match "plans"; non-ASCII keywords (CJK)
-    use plain substring matching.
+    ``content_keywords`` are matched against the body text only.
+
+    Match modes:
+    - "any": a keyword match in either tier keeps the article (broad recall).
+    - "all": every keyword in both tiers must match (narrowest).
+    - "groups": at least one keyword from each tier must match against the
+      title/summary: the topic tier (keywords) AND the region tier
+      (content_keywords). Title-only matching avoids body-text noise where
+      Western defense media mention the PLA/Indo-Pacific as background in
+      unrelated stories (e.g. Iran/Ukraine coverage).
+
+    ASCII keywords use word-boundary matching so that e.g. "pla" does not match
+    "plans"; non-ASCII keywords (CJK) use plain substring matching.
     """
     title_patterns = [_keyword_pattern(keyword) for keyword in keywords]
     body_patterns = [_keyword_pattern(keyword) for keyword in content_keywords]
+
+    def _matches(patterns: list[re.Pattern[str]], haystacks: list[str]) -> bool:
+        return any(
+            re.search(pattern, haystack)
+            for pattern in patterns
+            for haystack in haystacks
+        )
+
     kept: list[ExportArticleRecord] = []
     for record in records:
-        title_haystacks = _record_title_haystacks(record)
-        body_haystacks = _record_body_haystacks(record)
-        if require_all:
-            matched = all(
-                any(re.search(pattern, haystack) for haystack in title_haystacks)
-                for pattern in title_patterns
-            ) and all(
-                any(re.search(pattern, haystack) for haystack in body_haystacks)
-                for pattern in body_patterns
+        if match_mode == "groups":
+            # Title-only haystacks keep groups matching precise: the topic and
+            # region signals must both appear in the title, avoiding summary
+            # noise (e.g. "strategic" or "intelligence" in business copy).
+            title_haystacks = _record_title_haystacks(record, include_summary=False)
+            matched = _matches(title_patterns, title_haystacks) and _matches(
+                body_patterns, title_haystacks
             )
         else:
-            matched = any(
-                re.search(pattern, haystack)
-                for pattern in title_patterns
-                for haystack in title_haystacks
-            ) or any(
-                re.search(pattern, haystack)
-                for pattern in body_patterns
-                for haystack in body_haystacks
-            )
+            title_haystacks = _record_title_haystacks(record)
+            body_haystacks = _record_body_haystacks(record)
+            if match_mode == "all":
+                matched = all(
+                    _matches([pattern], title_haystacks) for pattern in title_patterns
+                ) and all(
+                    _matches([pattern], body_haystacks) for pattern in body_patterns
+                )
+            else:
+                matched = _matches(title_patterns, title_haystacks) or _matches(
+                    body_patterns, body_haystacks
+                )
         if matched:
             kept.append(record)
     return kept
@@ -219,17 +253,20 @@ def _dedupe_by_title(
     return list(best.values())
 
 
-def _record_title_haystacks(record: ExportArticleRecord) -> list[str]:
+def _record_title_haystacks(
+    record: ExportArticleRecord, *, include_summary: bool = True
+) -> list[str]:
     article = record.article
     translation = record.translation
     translated = translation.status == "succeeded"
     haystacks = [article.title or ""]
     if translated and translation.title:
         haystacks.append(translation.title)
-    if article.summary:
-        haystacks.append(article.summary)
-    if translated and translation.summary:
-        haystacks.append(translation.summary)
+    if include_summary:
+        if article.summary:
+            haystacks.append(article.summary)
+        if translated and translation.summary:
+            haystacks.append(translation.summary)
     return haystacks
 
 
