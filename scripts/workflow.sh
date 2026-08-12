@@ -3,15 +3,17 @@
 # full-text extract -> export the China/Indo-Pacific collection.
 #
 # Usage:
-#   bash scripts/workflow.sh [--days 3] [--extract] [--config rss-zen.toml]
+#   bash scripts/workflow.sh [--days 3] [--retry-translations] [--extract] [--config rss-zen.toml]
 #
-# --days N   Number of days to look back (used for export --since). Default 3.
-# --extract  Also run full-text extraction for articles without extracted text
-#            before exporting (enables the full_text content fallback).
+# --days N              Number of days to look back (used for export --since). Default 3.
+# --retry-translations  Retry failed/pending translations after sync.
+# --extract             Also run full-text extraction for articles without extracted text
+#                       before exporting (enables the full_text content fallback).
 set -Eeuo pipefail
 
 CONFIG="rss-zen.toml"
 DAYS=3
+DO_RETRY=0
 DO_EXTRACT=0
 
 while [[ $# -gt 0 ]]; do
@@ -19,6 +21,10 @@ while [[ $# -gt 0 ]]; do
         --days)
             DAYS="$2"
             shift 2
+            ;;
+        --retry-translations)
+            DO_RETRY=1
+            shift
             ;;
         --extract)
             DO_EXTRACT=1
@@ -39,6 +45,12 @@ cd "$(dirname "$0")/.."
 
 echo "==> sync feeds"
 uv run rss-zen sync --config "$CONFIG"
+
+if [[ "$DO_RETRY" -eq 1 ]]; then
+    echo "==> retry failed/pending translations"
+    uv run rss-zen translate --status failed --config "$CONFIG" || true
+    uv run rss-zen translate --status pending --config "$CONFIG" || true
+fi
 
 if [[ "$DO_EXTRACT" -eq 1 ]]; then
     echo "==> extract full text for articles without it"

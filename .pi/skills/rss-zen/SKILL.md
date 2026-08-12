@@ -1,6 +1,8 @@
 ---
 name: rss-zen
-description: RSS-Zen 本地多语言 RSS 工作流操作技能。同步 RSS/Atom 订阅源到 SQLite，翻译为简体中文（支持 Google/LibreTranslate/MyMemory/OpenAI 兼容提供商），通过 AnySearch 获取全文，导出 Markdown 合集。当用户需要同步订阅源、翻译文章、提取全文、导出 Markdown、查看处理状态、备份数据库、排查同步/翻译/导出故障，或修改 rss-zen.toml 配置时使用。
+version: 2.0.0
+description: RSS-Zen 本地多语言 RSS 工作流操作技能。同步 RSS/Atom 订阅源到 SQLite，翻译为简体中文（支持 Google/LibreTranslate/MyMemory/OpenAI 兼容提供商），通过 AnySearch 获取全文，导出 Markdown 合集。触发词：订阅源、RSS、feed、同步/刷新订阅、翻译文章、全文提取、导出/生成 Markdown 合集、近 N 日文章、印太/台海新闻合集、处理状态/status、备份数据库、doctor 诊断、rss-zen 命令。当用户需要同步订阅源、翻译文章、提取全文、导出 Markdown、查看处理状态、诊断故障（doctor）、备份数据库，或修改 rss-zen.toml 配置时使用。
+compatibility: Python 3.13+，需要 uv；项目根目录含 rss-zen.toml（生产配置不入库）
 ---
 
 # RSS-Zen 工作流
@@ -13,6 +15,29 @@ description: RSS-Zen 本地多语言 RSS 工作流操作技能。同步 RSS/Atom
 - 首次使用：`uv sync --locked`（从 `uv.lock` 锁定依赖）。
 - 配置文件默认 `rss-zen.toml`（TOML 或 YAML，schema 相同），参考 `example.rss-zen.toml`。
 - 所有命令用 `uv run rss-zen <command> --config <config>` 执行。
+
+## 状态前置检查（重要约定）
+
+**在运行任何耗时操作（sync/extract/translate/export）之前，先看数据现状：**
+
+```bash
+uv run rss-zen status --json --config rss-zen.toml
+```
+
+解析要点：
+- `counts.pending_translation` / `counts.failed_translation` / `counts.failed_extraction` 决定是否需要补翻/重试。
+- `last_sync.latest_feed_success` 是数据新鲜度指标：如果很久没同步，先 `sync` 再导出。
+- `last_sync.stale_feeds` 表示启用的源从未成功同步过（可能源已失效）。
+
+**排障第一命令是 `doctor`（不修改任何状态）：**
+
+```bash
+uv run rss-zen doctor --config rss-zen.toml        # 文本
+uv run rss-zen doctor --json --config rss-zen.toml # 机器可读 {healthy, checks[]}
+```
+
+它检查：配置 schema、密钥环境变量是否设置（只报 set/unset 不泄露值）、数据库完整性、
+启用的源是否曾成功、处理计数、备份新鲜度。
 
 ## 完整工作流（日常操作顺序）
 
@@ -31,13 +56,18 @@ uv run rss-zen sync --source "Feed name" --config rss-zen.toml
 # 3) 翻译（正常 sync 时自动翻译；也可显式重试）
 uv run rss-zen translate --article-id 42 --config rss-zen.toml
 uv run rss-zen translate --source "Feed name" --config rss-zen.toml
+uv run rss-zen translate --status failed --config rss-zen.toml   # 批量重试所有失败
+uv run rss-zen translate --status pending --config rss-zen.toml  # 批量重试所有待处理
 
 # 4) 全文提取（显式操作，普通 sync 不做提取）
 uv run rss-zen extract --article-id 42 --config rss-zen.toml
 uv run rss-zen extract --source "Feed name" --config rss-zen.toml
+uv run rss-zen extract --since 2d --config rss-zen.toml          # 近 2 天发布的文章
+uv run rss-zen extract --without-extraction --config rss-zen.toml # 补提取缺全文的
 
 # 5) 导出 Markdown 合集（按配置的 export profile）
-uv run rss-zen export daily --config rss-zen.toml
+uv run rss-zen export --config rss-zen.toml        # 无参数：列出可用 profiles
+uv run rss-zen export daily --config rss-zen.toml  # 导出指定 profile
 
 # 5b) 临时按时间导出（不改配置文件，--since/--until 支持 2d/12h/1w 或 ISO 时间）
 uv run rss-zen export daily --since 2d --config rss-zen.toml
@@ -46,12 +76,14 @@ uv run rss-zen export daily --since 2d --config rss-zen.toml
 uv run rss-zen list --since 2d --config rss-zen.toml
 uv run rss-zen list --source "Feed" --status succeeded --limit 20 --config rss-zen.toml
 
-# 6) 查看状态 / 备份
+# 6) 查看状态 / 诊断 / 备份
 uv run rss-zen status --config rss-zen.toml
+uv run rss-zen doctor --config rss-zen.toml
 uv run rss-zen backup --config rss-zen.toml
 ```
 
-常用辅助脚本：`scripts/workflow.sh`（一键 init → sync → export → status）、`scripts/recent.sh <days>`（一键导出近 N 日文章）。
+常用辅助脚本：`scripts/workflow.sh`（一键 sync → 可选补翻/提取 → export → status）、
+`.pi/skills/rss-zen/scripts/recent.sh <days>`（一键导出近 N 日文章）。
 
 ## 任务 → 命令速查表（Agent 优先用命令，不要直接改配置/SQL）
 
@@ -62,12 +94,16 @@ uv run rss-zen backup --config rss-zen.toml
 | 查某源的文章 | `uv run rss-zen list --source "Feed name" --config rss-zen.toml` |
 | 查翻译状态 | `uv run rss-zen list --status succeeded --config rss-zen.toml` |
 | 查翻译失败 | `uv run rss-zen list --status failed --config rss-zen.toml` |
+| 批量补翻失败/待处理 | `uv run rss-zen translate --status failed --config rss-zen.toml` |
 | 导出近 2 日文章 | `uv run rss-zen export daily --since 2d --config rss-zen.toml` |
+| 列出可用导出 profile | `uv run rss-zen export --config rss-zen.toml` |
 | 看处理状态 | `uv run rss-zen status --config rss-zen.toml` |
 | 机器可读状态 | `uv run rss-zen status --json --config rss-zen.toml` |
 | 机器可读文章列表 | `uv run rss-zen list --since 2d --json --config rss-zen.toml` |
+| 一键诊断（不修改状态） | `uv run rss-zen doctor --config rss-zen.toml` |
 | 重译某文章 | `uv run rss-zen translate --article-id 42 --config rss-zen.toml` |
-| 全文提取 | `uv run rss-zen extract --source "Feed name" --config rss-zen.toml` |
+| 全文提取（近 2 天） | `uv run rss-zen extract --since 2d --config rss-zen.toml` |
+| 补提取缺全文的 | `uv run rss-zen extract --without-extraction --config rss-zen.toml` |
 | 备份数据库 | `uv run rss-zen backup --config rss-zen.toml` |
 
 时间格式：`--since`/`--until` 支持相对时长（`2d`=2天、`12h`=12小时、`1w`=1周）或 ISO 时间。用 `--json` 可拿到结构化输出供 Agent 精确解析。
@@ -106,19 +142,32 @@ content_fallback = ["full_text", "rss_content", "summary"]
 - 翻译 provider 至少配置 1 个；`endpoint` 必须 HTTPS；`openai_compatible` 需要 `model`。
 - `google` kind 无需 endpoint 和 API key；长文本自动按 5000 字符分块。
 - 密钥通过环境变量注入（`api_key_env`），不写进配置文件/数据库。
-- 导出的 `translation_status` 过滤默认 `"succeeded"`——未翻译成功的文章不会出现在导出里。
+- 导出的 `translation_status` 过滤默认 `"succeeded"`——未翻译成功的文章不会出现在导出里（除非 profile 开了 `include_untranslated`）。
+- 导出 profile 支持关键词过滤（`keywords`/`content_keywords`）、标题去重（`dedupe_by=title` + `feed_priority`）。
 
-## 故障排查
+## 故障诊断
 
-| 症状 | 原因与处理 |
-|------|-----------|
-| `invalid configuration at ...` | 配置 schema 校验失败，按报错路径修正（如 provider 缺 endpoint/model） |
-| `translation_network_error` | 翻译接口不可达或超时；检查网络、endpoint、API key 环境变量 |
-| `translation_http_429` | MyMemory 等免费接口限流；改用 `google` kind 或等待配额恢复 |
-| `translation_provider_error` | Google 网页接口偶发失败；重试（retryable） |
-| `anysearch_exact_source_not_found` | AnySearch 未返回与文章 URL 完全匹配的结果；提取被保守拒绝 |
-| 导出 articles=0 | 文章翻译状态非 `succeeded`；检查 `status`，用 `translate` 补翻或调整导出 filter |
-| feed 同步失败 | 单个 feed 失败被隔离，不影响其他 feed；用 `status` 看 `last_error_code` |
+**第一步：`rss-zen doctor`** 定位配置/密钥/数据库/源健康问题，不要盲目重跑整个 sync。
+详细错误码 → 含义 → 处理方式见 [references/errors.md](references/errors.md)。
+
+决策树：
+
+| 症状 | 检查 | 处理 |
+|------|------|------|
+| `translate --status failed` 仍失败 | `status --json` 看 `failed_translation` 计数和错误聚合 | 按 errors.md 的翻译错误处理（429 换 google kind；网络问题稍后重试） |
+| 导出 articles=0 | 文章翻译状态非 `succeeded` | 用 `translate --status failed/pending` 补翻，或检查 profile 的关键词过滤是否过严 |
+| 某个源一直失败 | `status --json` 看该源 `last_error` | `feed_http_403/404`、`feed_host_unresolvable` 通常意味着源失效，考虑禁用/更换 |
+| 提取一直 `anysearch_exact_source_not_found` | 这是保守拒绝，属正常 | 换 AnySearch 之外的方式获取全文，或接受 RSS 摘要 |
+| 配置改了但不生效 | 检查 `doctor` 的 configuration 检查 | 按报错路径修正；密钥缺失会报 `env XXX is not set` |
+| 数据库损坏怀疑 | `doctor` 的 database 检查（PRAGMA quick_check） | 用 `backup` 恢复最近备份 |
+
+## 技能协同
+
+- **全文提取**：rss-zen 内置 AnySearch 提取（`extract` 命令），不需要单独调 anysearch skill。
+- **联网搜索**（查证/找源/搜最新资讯）：用 `byted-web-search` 或 `anysearch` skill，与 rss-zen 的数据管道互补。
+- **源管理**：用户要求添加/删除订阅源时，编辑 `rss-zen.toml` 的 `[[feeds]]` 段后执行
+  `rss-zen init`（同步到数据库）再 `sync`；失效源设 `enabled = false` 而不是删除，保留历史数据。
+- **微信/飞书交付**：导出的 `exports/*.md` 可直接作为附件或内容发送。
 
 ## 数据库（参考）
 
@@ -130,3 +179,5 @@ SQLite 表结构、字段与查询示例见 [references/database.md](references/
 uv run pytest -q                    # 全部测试
 uv run ruff check src/ tests/       # lint
 ```
+
+> ⚠️ 提交 git 更改时严禁包含生产数据：`data/*.sqlite3`、`rss-zen.toml`、`exports/`、`*.env` 均已 gitignore；只提交源码/测试/文档/脚本。

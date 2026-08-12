@@ -127,12 +127,16 @@ class ExtractionService:
         article_ids: tuple[int, ...] = (),
         source: str | None = None,
         without_extraction: bool = False,
+        published_after: str | None = None,
+        published_before: str | None = None,
     ) -> list[ExtractionOutcome]:
         """Select articles through repository filters, then extract each independently."""
         articles = self._database.list_articles(
             article_ids=article_ids,
             source=source,
             without_extraction=without_extraction,
+            published_after=published_after,
+            published_before=published_before,
         )
         return self.extract_articles(articles)
 

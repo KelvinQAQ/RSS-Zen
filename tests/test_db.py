@@ -180,6 +180,53 @@ def test_processing_results_and_export_run_are_persisted(database: Database) -> 
     assert export_run.article_count == 1
 
 
+def test_list_articles_by_translation_status_returns_distinct_articles(
+    database: Database,
+) -> None:
+    """Status selection returns one row per article, latest translation wins."""
+    feed = database.upsert_feed(_feed())
+    first = database.reconcile_article(feed.id, _article()).article
+    second = database.reconcile_article(
+        feed.id, _article(guid="article-2", canonical_url="https://example.test/two")
+    ).article
+    database.save_translation(
+        TranslationInput(
+            article_id=first.id,
+            target_language="zh-CN",
+            title=None,
+            summary=None,
+            content=None,
+            provider_name="free",
+            provider_model=None,
+            status="failed",
+            source_hash="hash-1",
+            error_code="translation_provider_error",
+            error_message="boom",
+            attempt_count=2,
+            terminal=True,
+        )
+    )
+    database.save_translation(
+        TranslationInput(
+            article_id=second.id,
+            target_language="zh-CN",
+            title="标题",
+            summary="",
+            content="内容",
+            provider_name="free",
+            provider_model=None,
+            status="succeeded",
+            source_hash="hash-2",
+        )
+    )
+
+    failed = database.list_articles_by_translation_status("zh-CN", status="failed")
+    succeeded = database.list_articles_by_translation_status("zh-CN", status="succeeded")
+
+    assert [article.id for article in failed] == [first.id]
+    assert [article.id for article in succeeded] == [second.id]
+
+
 def test_parameterized_sql_preserves_quote_characters(database: Database) -> None:
     feed = database.upsert_feed(_feed())
     article = database.reconcile_article(feed.id, _article()).article

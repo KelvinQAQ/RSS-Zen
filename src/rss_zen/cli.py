@@ -3,6 +3,7 @@
 import json
 import re
 import signal
+import sqlite3
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -13,7 +14,7 @@ import typer
 from rss_zen.backup import backup_database
 from rss_zen.config import load_config
 from rss_zen.db import Database
-from rss_zen.errors import AppError
+from rss_zen.errors import AppError, ConfigurationError
 from rss_zen.export import MarkdownExporter
 from rss_zen.extraction import AnySearchExtractor, ExtractionService
 from rss_zen.feeds import import_opml_file, reconcile_config_feeds
@@ -204,21 +205,39 @@ def sync(
 def translate(
     article_ids: list[int] | None = typer.Option(None, "--article-id", "-a"),
     source: str | None = typer.Option(None, "--source", "-s"),
+    status_filter: str | None = typer.Option(
+        None,
+        "--status",
+        help="Retry all articles whose translation is pending or failed.",
+    ),
     config_path: Path = typer.Option(Path("rss-zen.toml"), "--config", "-c"),
 ) -> None:
     """Retry translation for explicitly selected source articles."""
+    if status_filter is not None and status_filter not in {"pending", "failed"}:
+        _handle_app_error(
+            AppError(
+                "invalid_translation_status",
+                "--status must be one of: pending, failed",
+            )
+        )
+        return
     selected_ids = tuple(article_ids or [])
-    if not (selected_ids or source):
+    if not (selected_ids or source or status_filter):
         _handle_app_error(
             AppError(
                 "translation_selector_required",
-                "select articles with --article-id or --source",
+                "select articles with --article-id, --source, or --status",
             )
         )
         return
     try:
         database, config = _database_from_config(config_path)
-        articles = database.list_articles(article_ids=selected_ids, source=source)
+        if status_filter is not None:
+            articles = database.list_articles_by_translation_status(
+                config.translation.target_language, status=status_filter
+            )
+        else:
+            articles = database.list_articles(article_ids=selected_ids, source=source)
         if not articles:
             raise AppError("article_not_found", "no article matches the requested selector")
         with httpx.Client(timeout=30.0) as client:
@@ -230,7 +249,7 @@ def translate(
                 max_backoff_minutes=config.service.retry_max_backoff_minutes,
             )
             outcomes = [
-                service.translate_article(article)
+                service.translate_article(article, force=True)
                 for article in articles
             ]
     except AppError as error:
@@ -269,21 +288,34 @@ def import_opml(
 def extract(
     article_ids: list[int] | None = typer.Option(None, "--article-id", "-a"),
     source: str | None = typer.Option(None, "--source", "-s"),
+    since: str | None = typer.Option(
+        None,
+        "--since",
+        help="Only articles published since: a duration (2d, 12h, 1w) or ISO datetime.",
+    ),
+    until: str | None = typer.Option(
+        None,
+        "--until",
+        help="Only articles published before: a duration or ISO datetime.",
+    ),
     without_extraction: bool = typer.Option(False, "--without-extraction"),
     config_path: Path = typer.Option(Path("rss-zen.toml"), "--config", "-c"),
 ) -> None:
     """Retrieve full text for selected articles."""
     selected_ids = tuple(article_ids or [])
-    if not (selected_ids or source or without_extraction):
+    if not (selected_ids or source or without_extraction or since or until):
         _handle_app_error(
             AppError(
                 "extraction_selector_required",
-                "select articles with --article-id, --source, or --without-extraction",
+                "select articles with --article-id, --source, --since/--until, "
+                "or --without-extraction",
             )
         )
         return
     try:
         database, config = _database_from_config(config_path)
+        published_after = _parse_time_bound(since)
+        published_before = _parse_time_bound(until)
         with httpx.Client(timeout=30.0) as client:
             translator = build_translation_service(
                 database,
@@ -301,6 +333,8 @@ def extract(
                 article_ids=selected_ids,
                 source=source,
                 without_extraction=without_extraction,
+                published_after=published_after,
+                published_before=published_before,
             )
     except AppError as error:
         _handle_app_error(error)
@@ -391,7 +425,7 @@ def list_articles(
 
 @app.command("export")
 def export_articles(
-    profile_name: str = typer.Argument(...),
+    profile_name: str | None = typer.Argument(None),
     since: str | None = typer.Option(
         None,
         "--since",
@@ -402,11 +436,34 @@ def export_articles(
         "--until",
         help="Only articles published before: a duration or ISO datetime.",
     ),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
     config_path: Path = typer.Option(Path("rss-zen.toml"), "--config", "-c"),
 ) -> None:
     """Export articles using a named Markdown profile."""
     try:
         database, config = _database_from_config(config_path)
+        if profile_name is None:
+            profiles = [
+                {
+                    "name": profile.name,
+                    "output_path": str(
+                        profile.output_path
+                        if profile.output_path.is_absolute()
+                        else config_path.parent / profile.output_path
+                    ),
+                    "title": profile.title or "",
+                }
+                for profile in config.exports
+            ]
+            if json_output:
+                _json_echo(profiles)
+                return
+            if not profiles:
+                typer.echo("no export profiles configured")
+                return
+            for profile in profiles:
+                typer.echo(f"{profile['name']}: {profile['output_path']}")
+            return
         profile = next((item for item in config.exports if item.name == profile_name), None)
         if profile is None:
             raise AppError("export_profile_not_found", f"unknown export profile: {profile_name}")
@@ -439,6 +496,159 @@ def export_articles(
         f"export_run_id={result.export_run_id}"
     )
     typer.echo(message)
+
+
+@app.command("doctor")
+def doctor(
+    config_path: Path = typer.Option(Path("rss-zen.toml"), "--config", "-c"),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Diagnose configuration, database integrity, secrets, and processing health.
+
+    Never modifies state: it does not create the database or contact providers.
+    """
+    checks: list[dict[str, object]] = []
+
+    def _check(name: str, status: str, detail: str) -> None:
+        checks.append({"check": name, "status": status, "detail": detail})
+
+    # 1. Configuration schema and secret resolution.
+    config: AppConfig | None = None
+    try:
+        config = load_config(config_path)
+        _check(
+            "configuration",
+            "ok",
+            f"loaded {len(config.feeds)} feeds, {len(config.exports)} export profiles",
+        )
+    except ConfigurationError as error:
+        _check("configuration", "error", error.message)
+
+    # 2. Secret presence without leaking values.
+    if config is not None:
+        for provider in config.translation.providers:
+            name = f"secret:{provider.name}"
+            if provider.api_key_env is None:
+                _check(name, "ok", "no API key required")
+            elif provider.api_key:
+                _check(name, "ok", f"env {provider.api_key_env} is set")
+            else:
+                _check(
+                    name,
+                    "warning",
+                    f"env {provider.api_key_env} is not set; provider may fail",
+                )
+        if config.anysearch.api_key_env is not None:
+            name = "secret:anysearch"
+            if config.anysearch.api_key:
+                _check(name, "ok", f"env {config.anysearch.api_key_env} is set")
+            else:
+                _check(
+                    name,
+                    "warning",
+                    f"env {config.anysearch.api_key_env} is not set; extraction will fail",
+                )
+
+    # 3. Database file and integrity (without initializing/creating).
+    database: Database | None = None
+    database_path = (
+        config_path.parent / config.database.path
+        if config is not None and not config.database.path.is_absolute()
+        else (config_path.parent / "rss-zen.sqlite3" if config is None else config.database.path)
+    )
+    if config is not None:
+        if not database_path.is_file():
+            _check(
+                "database",
+                "warning",
+                f"not found at {database_path}; run 'rss-zen init' first",
+            )
+        else:
+            try:
+                size_mb = database_path.stat().st_size / (1024 * 1024)
+                connection = sqlite3.connect(database_path)
+                try:
+                    result = connection.execute("PRAGMA quick_check").fetchone()
+                finally:
+                    connection.close()
+                integrity = result[0] if result else "unknown"
+                if integrity == "ok":
+                    database = Database(database_path)
+                    _check(
+                        "database",
+                        "ok",
+                        f"{database_path.name} ({size_mb:.1f} MB), integrity ok",
+                    )
+                else:
+                    _check("database", "error", f"integrity check failed: {integrity}")
+            except sqlite3.Error as error:
+                _check("database", "error", f"cannot open database: {error}")
+
+    # 4. Feed and processing health from the repository (only when initialized).
+    if database is not None:
+        try:
+            feeds = database.list_feeds()
+            enabled = [feed for feed in feeds if feed.enabled]
+            never_succeeded = [
+                feed for feed in enabled if feed.last_success_at is None
+            ]
+            latest_success = max(
+                (feed.last_success_at for feed in feeds if feed.last_success_at), default=None
+            )
+            _check(
+                "feeds",
+                "ok" if not never_succeeded else "warning",
+                f"{len(feeds)} total, {len(enabled)} enabled, "
+                f"{len(never_succeeded)} enabled never succeeded",
+            )
+            _check(
+                "sync",
+                "ok" if latest_success else "warning",
+                f"latest feed success: {latest_success or 'never'}",
+            )
+            counts = database.processing_counts(config.translation.target_language)
+            problems = counts.failed_translation_count + counts.failed_extraction_count
+            _check(
+                "processing",
+                "ok" if problems == 0 else "warning",
+                f"{counts.article_count} articles, "
+                f"{counts.pending_translation_count} pending, "
+                f"{counts.failed_translation_count} failed translation, "
+                f"{counts.failed_extraction_count} failed extraction",
+            )
+        except sqlite3.Error as error:
+            _check("repository", "error", f"cannot read repository state: {error}")
+
+    # 5. Backup freshness.
+    backup_directory = config_path.parent / "backups"
+    backups = sorted(
+        backup_directory.glob("*.sqlite3*")
+    ) if backup_directory.is_dir() else []
+    if not backups:
+        _check("backup", "warning", "no backups found; run 'rss-zen backup' regularly")
+    else:
+        newest = backups[-1]
+        age = datetime.now(UTC) - datetime.fromtimestamp(newest.stat().st_mtime, UTC)
+        _check(
+            "backup",
+            "ok" if age.days <= 2 else "warning",
+            f"newest: {newest.name} ({age.days}d old)",
+        )
+
+    if json_output:
+        _json_echo(
+            {
+                "healthy": all(check["status"] != "error" for check in checks),
+                "checks": checks,
+            }
+        )
+        return
+    for check in checks:
+        status = check["status"]
+        icon = {"ok": "ok", "warning": "warn", "error": "error"}[str(status)]
+        typer.echo(f"{icon} {check['check']}: {check['detail']}")
+    if any(check["status"] == "error" for check in checks):
+        raise typer.Exit(code=1)
 
 
 @app.command()
@@ -475,6 +685,10 @@ def status(
         _handle_app_error(error)
         return
     if json_output:
+        feeds = database.list_feeds()
+        latest_success = max(
+            (feed.last_success_at for feed in feeds if feed.last_success_at), default=None
+        )
         _json_echo(
             {
                 "counts": {
@@ -483,6 +697,12 @@ def status(
                     "failed_translation": counts.failed_translation_count,
                     "terminal_translation": counts.terminal_translation_count,
                     "failed_extraction": counts.failed_extraction_count,
+                },
+                "last_sync": {
+                    "latest_feed_success": latest_success,
+                    "stale_feeds": sum(
+                        1 for feed in feeds if feed.enabled and feed.last_success_at is None
+                    ),
                 },
                 "feeds": [
                     {
@@ -493,7 +713,7 @@ def status(
                         "last_success": feed.last_success_at,
                         "last_error": feed.last_error_code,
                     }
-                    for feed in database.list_feeds()
+                    for feed in feeds
                 ],
                 "errors": [
                     {

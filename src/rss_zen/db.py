@@ -558,6 +558,8 @@ class Database:
         article_ids: tuple[int, ...] = (),
         source: str | None = None,
         without_extraction: bool = False,
+        published_after: str | None = None,
+        published_before: str | None = None,
     ) -> list[ArticleRecord]:
         """List articles selected by safe, explicit repository filters."""
         conditions: list[str] = []
@@ -569,6 +571,12 @@ class Database:
         if source is not None:
             conditions.append("(feeds.name = ? OR feeds.url = ?)")
             parameters.extend((source, source))
+        if published_after is not None:
+            conditions.append("articles.published_at >= ?")
+            parameters.append(published_after)
+        if published_before is not None:
+            conditions.append("articles.published_at <= ?")
+            parameters.append(published_before)
         if without_extraction:
             conditions.append(
                 "NOT EXISTS (SELECT 1 FROM extractions WHERE extractions.article_id = articles.id "
@@ -580,6 +588,28 @@ class Database:
             "JOIN feeds ON feeds.id = articles.feed_id "
             f"{where} ORDER BY articles.published_at DESC, articles.id DESC"
         )
+        with self._connection() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [_article_from_row(row) for row in rows]
+
+    def list_articles_by_translation_status(
+        self, target_language: str, *, status: str, limit: int | None = None
+    ) -> list[ArticleRecord]:
+        """List distinct articles whose latest persisted translation has the given status."""
+        limit_clause = " LIMIT ?" if limit else ""
+        parameters: list[object] = [target_language, status]
+        if limit:
+            parameters.append(limit)
+        query = f"""
+            SELECT articles.*
+            FROM translations
+            JOIN articles ON articles.id = translations.article_id
+            WHERE translations.target_language = ?
+              AND translations.status = ?
+            GROUP BY articles.id
+            ORDER BY MAX(translations.id) DESC
+            {limit_clause}
+        """
         with self._connection() as connection:
             rows = connection.execute(query, parameters).fetchall()
         return [_article_from_row(row) for row in rows]

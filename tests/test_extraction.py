@@ -127,3 +127,33 @@ def test_extraction_only_selects_requested_article_ids(tmp_path: Path) -> None:
 
     assert [result.article_id for result in results] == [second.id]
     assert database.latest_extraction(first.id) is None
+
+
+def test_extraction_selects_by_published_window(tmp_path: Path) -> None:
+    """extract_selected respects the published_after/before window."""
+    database = Database(tmp_path / "rss-zen.sqlite3")
+    database.initialize()
+    old = _article(database)
+    recent = database.reconcile_article(
+        old.feed_id,
+        ArticleInput(
+            guid="article-2",
+            canonical_url="https://example.test/articles/two",
+            title="Recent",
+            summary=None,
+            content=None,
+            author=None,
+            categories=(),
+            published_at="2026-08-12T10:00:00+00:00",
+            source_language="en",
+        ),
+    ).article
+    service = ExtractionService(database, StaticExtractor(), translator=StaticTranslator())
+
+    results = service.extract_selected(
+        published_after="2026-08-12T00:00:00+00:00",
+        published_before="2026-08-13T00:00:00+00:00",
+    )
+
+    assert [result.article_id for result in results] == [recent.id]
+    assert database.latest_extraction(old.id) is None
