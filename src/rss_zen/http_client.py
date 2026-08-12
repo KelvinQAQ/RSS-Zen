@@ -12,6 +12,11 @@ import httpx
 from rss_zen.errors import AppError
 from rss_zen.network import FeedUrlPolicy
 
+_DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+)
+
 
 class FeedHttpClient:
     """Fetch feeds with validated redirects, bounded payloads, and retries."""
@@ -45,10 +50,14 @@ class FeedHttpClient:
 
     def get_feed(self, url: str, headers: Mapping[str, str]) -> httpx.Response:
         """Get one validated feed, retrying only bounded transient failures."""
+        request_headers = dict(headers)
+        # Some publishers block default python-httpx user agents; use a browser
+        # user agent unless the caller explicitly provides one.
+        request_headers.setdefault("User-Agent", _DEFAULT_USER_AGENT)
         initial_url = self._validate_url(url)
         for attempt in range(1, self._max_attempts + 1):
             try:
-                response = self._get_once(initial_url, headers)
+                response = self._get_once(initial_url, request_headers)
             except httpx.TimeoutException as error:
                 if attempt == self._max_attempts:
                     raise AppError(
