@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
 
+import rss_zen.db as db_module
 from rss_zen.db import (
     ArticleInput,
     Database,
@@ -59,6 +61,48 @@ def test_initialization_creates_current_schema(database: Database) -> None:
         "export_runs",
         "sync_runs",
     }
+
+
+def test_migration_snapshot_includes_uncheckpointed_wal_data(tmp_path: Path) -> None:
+    """Pre-migration snapshots must include committed records still held in WAL."""
+    database_path = tmp_path / "rss-zen.sqlite3"
+    writer = sqlite3.connect(database_path)
+    try:
+        writer.execute("PRAGMA journal_mode = WAL")
+        writer.executescript(db_module._MIGRATION_1)
+        writer.executescript(db_module._MIGRATION_2)
+        writer.execute(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+        )
+        writer.executemany(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+            [(1, "2026-08-11T00:00:00+00:00"), (2, "2026-08-11T00:00:01+00:00")],
+        )
+        writer.commit()
+        writer.execute(
+            """
+            INSERT INTO feeds(name, url, categories_json, enabled, origin, created_at, updated_at)
+            VALUES (?, ?, '[]', 1, 'config', ?, ?)
+            """,
+            (
+                "Stored in WAL",
+                "https://example.test/wal.xml",
+                "2026-08-12T00:00:00+00:00",
+                "2026-08-12T00:00:00+00:00",
+            ),
+        )
+        writer.commit()
+
+        Database(database_path).initialize()
+    finally:
+        writer.close()
+
+    snapshots = list((tmp_path / "backups" / "pre-migration").glob("*.sqlite3"))
+    assert len(snapshots) == 1
+    with sqlite3.connect(snapshots[0]) as snapshot:
+        assert snapshot.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert snapshot.execute("SELECT name FROM feeds").fetchone()[0] == "Stored in WAL"
+    assert Database(database_path).schema_version() == 3
 
 
 def test_upsert_feed_updates_existing_record(database: Database) -> None:

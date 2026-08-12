@@ -1,4 +1,4 @@
-﻿# Linux Production Hardening Implementation Plan
+# Linux Production Hardening Implementation Plan
 
 > **For Codex:** REQUIRED SUB-SKILL: Use `executing-plans` to implement this plan task-by-task.
 

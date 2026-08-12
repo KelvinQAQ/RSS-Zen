@@ -242,6 +242,42 @@ api_key_env = "FREE_TRANSLATION_API_KEY"
     assert payload["healthy"] is True
 
 
+def test_doctor_uses_configured_backup_directory(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("FREE_TRANSLATION_API_KEY", "free-secret")
+    config_path = tmp_path / "rss-zen.toml"
+    config_path.write_text(
+        """
+[database]
+path = "rss-zen.sqlite3"
+
+[backup]
+directory = "managed-backups"
+
+[translation]
+target_language = "zh-CN"
+
+[[translation.providers]]
+name = "free"
+kind = "libretranslate"
+endpoint = "https://translate.example.test/translate"
+api_key_env = "FREE_TRANSLATION_API_KEY"
+""",
+        encoding="utf-8",
+    )
+    from rss_zen.backup import backup_database
+    from rss_zen.db import Database
+
+    database = Database(tmp_path / "rss-zen.sqlite3")
+    database.initialize()
+    backup_database(database.path, tmp_path / "managed-backups")
+
+    result = runner.invoke(app, ["doctor", "--config", str(config_path)])
+
+    assert result.exit_code == 0
+    assert "ok backup:" in result.stdout
+    assert "no backups found" not in result.stdout
+
+
 def test_doctor_reports_configuration_error(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("FREE_TRANSLATION_API_KEY", "free-secret")
     config_path = tmp_path / "rss-zen.toml"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
@@ -44,6 +45,18 @@ class LimitsSettings(BaseModel):
     max_entries_per_feed: int = Field(default=500, ge=1)
     max_article_chars: int = Field(default=500_000, ge=1)
     max_translation_chars: int = Field(default=100_000, ge=1)
+    max_extract_articles_per_run: int = Field(default=20, ge=1)
+    max_translate_articles_per_run: int = Field(default=50, ge=1)
+
+
+class BackupSettings(BaseModel):
+    """Destination and bounded retention for verified SQLite snapshots."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    directory: Path = Path("backups")
+    retention_days: int = Field(default=30, ge=1)
+    retention_count: int = Field(default=30, ge=1)
 
 
 class TranslationProviderConfig(BaseModel):
@@ -83,7 +96,7 @@ class TranslationProviderConfig(BaseModel):
     @field_validator("kind")
     @classmethod
     def _supported_kind(cls, value: str) -> str:
-        supported = {"libretranslate", "mymemory", "openai_compatible", "google"}
+        supported = {"libretranslate", "mymemory", "openai_compatible"}
         if value not in supported:
             raise ValueError(f"unsupported translation provider kind: {value}")
         return value
@@ -163,6 +176,19 @@ class AnySearchSettings(BaseModel):
         return value
 
 
+_HEADER_NAME_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+_ENVIRONMENT_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_FORBIDDEN_REQUEST_HEADERS = {
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "proxy-authorization",
+    "proxy-connection",
+}
+_SECRET_REQUEST_HEADERS = {"authorization", "cookie"}
+
+
 class FeedConfig(BaseModel):
     """One configured RSS or Atom feed."""
 
@@ -177,10 +203,18 @@ class FeedConfig(BaseModel):
     headers: dict[str, str] = Field(
         default_factory=dict,
         description=(
-            "Optional extra request headers sent when fetching this feed "
-            "(for example a custom User-Agent to satisfy publisher allowlists)."
+            "Optional non-secret request headers (for example a custom User-Agent). "
+            "Authorization and Cookie must be supplied through header_env."
         ),
     )
+    header_env: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Sensitive request headers mapped to their required environment variable names, "
+            "for example {Authorization = 'PRIVATE_FEED_TOKEN'}."
+        ),
+    )
+    resolved_headers: dict[str, str] = Field(default_factory=dict, exclude=True, repr=False)
     fetcher: Literal["auto", "curl"] = Field(
         default="auto",
         description=(
@@ -199,6 +233,30 @@ class FeedConfig(BaseModel):
         if parsed.username is not None or parsed.password is not None:
             raise ValueError("feed URL must not include URL credentials")
         return value
+
+    @field_validator("headers")
+    @classmethod
+    def _safe_headers(cls, headers: dict[str, str]) -> dict[str, str]:
+        _validate_headers(headers, allow_secret_headers=False)
+        return headers
+
+    @field_validator("header_env")
+    @classmethod
+    def _safe_header_environment(cls, header_env: dict[str, str]) -> dict[str, str]:
+        _validate_headers({name: environment for name, environment in header_env.items()})
+        if any(
+            not _ENVIRONMENT_NAME_RE.fullmatch(environment) for environment in header_env.values()
+        ):
+            raise ValueError("header_env values must be valid environment variable names")
+        return header_env
+
+    @model_validator(mode="after")
+    def _header_names_are_unique(self) -> FeedConfig:
+        direct = {name.casefold() for name in self.headers}
+        secret = {name.casefold() for name in self.header_env}
+        if direct & secret:
+            raise ValueError("headers and header_env must not define the same header")
+        return self
 
 
 class ExportProfile(BaseModel):
@@ -332,6 +390,28 @@ class PreprocessStep(BaseModel):
         return self
 
 
+def _validate_headers(headers: dict[str, str], *, allow_secret_headers: bool = True) -> None:
+    if len(headers) > 20:
+        raise ValueError("feeds may define at most 20 request headers")
+    total_size = 0
+    for name, value in headers.items():
+        normalized = name.casefold()
+        if len(name) > 64 or not _HEADER_NAME_RE.fullmatch(name):
+            raise ValueError("request header names must be valid HTTP tokens up to 64 characters")
+        if normalized in _FORBIDDEN_REQUEST_HEADERS:
+            raise ValueError(f"request header {name!r} is managed by the HTTP client")
+        if not allow_secret_headers and normalized in _SECRET_REQUEST_HEADERS:
+            raise ValueError(f"request header {name!r} must be configured through header_env")
+        has_control_character = any(
+            ord(character) < 32 or ord(character) == 127 for character in value
+        )
+        if len(value) > 2048 or has_control_character:
+            raise ValueError("request header values must be printable and at most 2048 characters")
+        total_size += len(name) + len(value)
+    if total_size > 8192:
+        raise ValueError("request headers must not exceed 8192 characters in total")
+
+
 class AppConfig(BaseModel):
     """Complete application configuration after secret resolution."""
 
@@ -340,6 +420,7 @@ class AppConfig(BaseModel):
     database: DatabaseSettings
     service: ServiceSettings = Field(default_factory=ServiceSettings)
     limits: LimitsSettings = Field(default_factory=LimitsSettings)
+    backup: BackupSettings = Field(default_factory=BackupSettings)
     translation: TranslationSettings
     anysearch: AnySearchSettings = Field(default_factory=AnySearchSettings)
     feeds: list[FeedConfig] = Field(default_factory=list)

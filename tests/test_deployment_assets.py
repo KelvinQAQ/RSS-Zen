@@ -29,9 +29,10 @@ def test_systemd_assets_use_non_root_service_and_absolute_commands() -> None:
         "--config /etc/rss-zen/rss-zen.toml"
     ) in export_service
     assert (
-        "/opt/rss-zen/current/.venv/bin/rss-zen backup --backup-directory /var/lib/rss-zen/backups"
-        in backup_service
-    )
+        "/opt/rss-zen/current/.venv/bin/rss-zen backup "
+        "--config /etc/rss-zen/rss-zen.toml"
+    ) in backup_service
+    assert "--backup-directory" not in backup_service
 
 
 def test_timers_are_persistent_and_use_expected_units() -> None:

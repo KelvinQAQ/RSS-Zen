@@ -8,7 +8,7 @@ from rss_zen.backup import backup_database
 from rss_zen.db import Database, FeedInput
 
 
-def test_backup_is_readable_and_retention_is_bounded(tmp_path: Path) -> None:
+def test_backup_is_readable_and_retention_is_bounded_by_count(tmp_path: Path) -> None:
     database_path = tmp_path / "rss-zen.sqlite3"
     database = Database(database_path)
     database.initialize()
@@ -18,19 +18,22 @@ def test_backup_is_readable_and_retention_is_bounded(tmp_path: Path) -> None:
     first = backup_database(
         database_path,
         backup_directory,
-        retention_days=2,
+        retention_days=30,
+        retention_count=2,
         now=datetime(2026, 8, 10, tzinfo=UTC),
     )
     second = backup_database(
         database_path,
         backup_directory,
-        retention_days=2,
+        retention_days=30,
+        retention_count=2,
         now=datetime(2026, 8, 11, tzinfo=UTC),
     )
     third = backup_database(
         database_path,
         backup_directory,
-        retention_days=2,
+        retention_days=30,
+        retention_count=2,
         now=datetime(2026, 8, 12, tzinfo=UTC),
     )
 
@@ -41,6 +44,30 @@ def test_backup_is_readable_and_retention_is_bounded(tmp_path: Path) -> None:
     assert second.exists()
     assert third.exists()
     assert len(list(backup_directory.glob("rss-zen-*.sqlite3"))) == 2
+
+
+def test_backup_retention_days_prunes_old_snapshots_but_keeps_newest(tmp_path: Path) -> None:
+    database_path = tmp_path / "rss-zen.sqlite3"
+    Database(database_path).initialize()
+    backup_directory = tmp_path / "backups"
+
+    old = backup_database(
+        database_path,
+        backup_directory,
+        retention_days=2,
+        retention_count=10,
+        now=datetime(2026, 8, 10, tzinfo=UTC),
+    )
+    recent = backup_database(
+        database_path,
+        backup_directory,
+        retention_days=2,
+        retention_count=10,
+        now=datetime(2026, 8, 13, tzinfo=UTC),
+    )
+
+    assert not old.exists()
+    assert recent.exists()
 
 
 def test_backup_leaves_unrelated_files_untouched(tmp_path: Path) -> None:

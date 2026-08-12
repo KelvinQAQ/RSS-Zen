@@ -15,7 +15,13 @@ jobs:
           python-version: "3.13"
       - name: Install dependencies
         run: uv sync --locked
+      - name: Validate repository text
+        run: |
+          git diff --check
+          uv run python scripts/check_text_encoding.py
       - name: Lint
         run: uv run ruff check src tests
       - name: Test
         run: uv run pytest -q
+      - name: Audit Python dependencies
+        run: uv run pip-audit

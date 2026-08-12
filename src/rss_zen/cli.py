@@ -214,6 +214,10 @@ def translate(
         "--status",
         help="Retry all articles whose translation is pending or failed.",
     ),
+    limit: int | None = typer.Option(None, "--limit", min=1),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="List selected articles without calling providers."
+    ),
     config_path: Path = typer.Option(Path("rss-zen.toml"), "--config", "-c"),
 ) -> None:
     """Retry translation for explicitly selected source articles."""
@@ -236,14 +240,22 @@ def translate(
         return
     try:
         database, config = _database_from_config(config_path)
+        effective_limit = limit or config.limits.max_translate_articles_per_run
         if status_filter is not None:
             articles = database.list_articles_by_translation_status(
-                config.translation.target_language, status=status_filter
+                config.translation.target_language, status=status_filter, limit=effective_limit
             )
         else:
-            articles = database.list_articles(article_ids=selected_ids, source=source)
+            articles = database.list_articles(
+                article_ids=selected_ids, source=source
+            )[:effective_limit]
         if not articles:
             raise AppError("article_not_found", "no article matches the requested selector")
+        if dry_run:
+            for article in articles:
+                typer.echo(f"article_id={article.id} title={article.title}")
+            typer.echo(f"selected={len(articles)} dry_run=true")
+            return
         with httpx.Client(timeout=30.0) as client:
             service = build_translation_service(
                 database,
@@ -303,6 +315,10 @@ def extract(
         help="Only articles published before: a duration or ISO datetime.",
     ),
     without_extraction: bool = typer.Option(False, "--without-extraction"),
+    limit: int | None = typer.Option(None, "--limit", min=1),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="List selected articles without calling providers."
+    ),
     config_path: Path = typer.Option(Path("rss-zen.toml"), "--config", "-c"),
 ) -> None:
     """Retrieve full text for selected articles."""
@@ -320,6 +336,20 @@ def extract(
         database, config = _database_from_config(config_path)
         published_after = _parse_time_bound(since)
         published_before = _parse_time_bound(until)
+        articles = database.list_articles(
+            article_ids=selected_ids,
+            source=source,
+            without_extraction=without_extraction,
+            published_after=published_after,
+            published_before=published_before,
+        )[: limit or config.limits.max_extract_articles_per_run]
+        if not articles:
+            raise AppError("article_not_found", "no article matches the requested selector")
+        if dry_run:
+            for article in articles:
+                typer.echo(f"article_id={article.id} title={article.title}")
+            typer.echo(f"selected={len(articles)} dry_run=true")
+            return
         with httpx.Client(timeout=30.0) as client:
             translator = build_translation_service(
                 database,
@@ -333,13 +363,7 @@ def extract(
                 AnySearchExtractor(config.anysearch, client),
                 translator=translator,
             )
-            results = service.extract_selected(
-                article_ids=selected_ids,
-                source=source,
-                without_extraction=without_extraction,
-                published_after=published_after,
-                published_before=published_before,
-            )
+            results = service.extract_articles(articles)
     except AppError as error:
         _handle_app_error(error)
         return
@@ -624,10 +648,12 @@ def doctor(
             _check("repository", "error", f"cannot read repository state: {error}")
 
     # 5. Backup freshness.
-    backup_directory = config_path.parent / "backups"
-    backups = sorted(
-        backup_directory.glob("*.sqlite3*")
-    ) if backup_directory.is_dir() else []
+    backup_directory = (
+        _resolve_config_path(config.backup.directory, config_path)
+        if config is not None
+        else config_path.parent / "backups"
+    )
+    backups = sorted(backup_directory.glob("rss-*.sqlite3")) if backup_directory.is_dir() else []
     if not backups:
         _check("backup", "warning", "no backups found; run 'rss-zen backup' regularly")
     else:
@@ -657,21 +683,27 @@ def doctor(
 
 @app.command()
 def backup(
-    backup_directory: Path = typer.Option(Path("backups"), "--backup-directory", "-o"),
-    retention_days: int = typer.Option(30, "--retention-days", min=1),
+    backup_directory: Path | None = typer.Option(None, "--backup-directory", "-o"),
+    retention_days: int | None = typer.Option(None, "--retention-days", min=1),
+    retention_count: int | None = typer.Option(None, "--retention-count", min=1),
     config_path: Path = typer.Option(Path("rss-zen.toml"), "--config", "-c"),
 ) -> None:
-    """Create one verified local SQLite backup and apply retention."""
+    """Create one verified local SQLite backup and apply configured retention."""
     try:
-        database, _config = _database_from_config(config_path)
-        target = backup_directory
-        if not target.is_absolute():
-            target = config_path.parent / target
-        result = backup_database(database.path, target, retention_days=retention_days)
+        database, config = _database_from_config(config_path)
+        target = _resolve_config_path(backup_directory or config.backup.directory, config_path)
+        days = retention_days or config.backup.retention_days
+        count = retention_count or config.backup.retention_count
+        result = backup_database(
+            database.path,
+            target,
+            retention_days=days,
+            retention_count=count,
+        )
     except AppError as error:
         _handle_app_error(error)
         return
-    typer.echo(f"backup={result} retention_days={retention_days}")
+    typer.echo(f"backup={result} retention_days={days} retention_count={count}")
 
 
 @app.command()
@@ -757,12 +789,17 @@ def status(
         typer.echo(f"{error.workflow}_error={error.error_code} count={error.count}")
 
 
+def _resolve_config_path(path: Path, config_path: Path) -> Path:
+    """Resolve an application path relative to its configuration file."""
+    return path if path.is_absolute() else config_path.parent / path
+
+
 def _config_feed_headers(config: AppConfig) -> dict[str, dict[str, str]]:
     """Index per-feed custom request headers by normalized feed URL."""
     return {
-        normalize_feed_url(feed.url): dict(feed.headers)
+        normalize_feed_url(feed.url): dict(feed.resolved_headers)
         for feed in config.feeds
-        if feed.headers
+        if feed.resolved_headers
     }
 
 

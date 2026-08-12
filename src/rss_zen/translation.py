@@ -15,11 +15,6 @@ from rss_zen.db import ArticleRecord, Database, TranslationInput
 from rss_zen.errors import AppError
 from rss_zen.models import TranslationProviderConfig, TranslationSettings
 
-try:
-    from deep_translator import GoogleTranslator
-except Exception:  # pragma: no cover - optional dependency
-    GoogleTranslator = None
-
 DetectorFactory.seed = 0
 
 
@@ -248,60 +243,6 @@ class MyMemoryProvider:
         return translated
 
 
-class GoogleProvider:
-    """Translate through deep_translator's free GoogleTranslate web endpoint.
-
-    Requires no API key or endpoint configuration. Falls back gracefully when the
-    deep_translator package is unavailable or a request is rejected. Long text is
-    split into per-request chunks because GoogleTranslate caps each request.
-    """
-
-    _default_max_chars = 5000
-    # deep_translator's GoogleTranslate validates ``len(text) < 5000`` (strict), so
-    # per-request chunks must stay below its hard cap even when a chunk is exactly
-    # 5000 characters or the operator overrides max_chars upward.
-    _hard_cap = 4999
-
-    def __init__(self, config: TranslationProviderConfig) -> None:
-        self.name = config.name
-        self.model = None
-        self._timeout = config.timeout_seconds
-        self._max_chars = min(
-            config.max_chars or self._default_max_chars, self._hard_cap
-        )
-
-    def translate(self, text: str, source_language: str | None, target_language: str) -> str:
-        if GoogleTranslator is None:
-            raise TranslationProviderError(
-                "translation_unavailable",
-                "deep_translator is not installed; google provider unavailable",
-                retryable=False,
-            )
-        chunks = _split_text_chunks(text, max_chars=self._max_chars)
-        translated_chunks = [
-            self._translate_chunk(chunk, source_language, target_language) for chunk in chunks
-        ]
-        return "\n".join(translated_chunks).strip()
-
-    def _translate_chunk(self, text: str, source_language: str | None, target_language: str) -> str:
-        try:
-            translator = GoogleTranslator(source="auto", target=target_language)
-            translated = translator.translate(text)
-        except TranslationProviderError:
-            raise
-        except Exception as error:  # deep_translator raises many exception types
-            raise TranslationProviderError(
-                "translation_provider_error",
-                f"Google translation request failed: {error}",
-                retryable=True,
-            ) from error
-        if not isinstance(translated, str) or not translated.strip():
-            raise TranslationProviderError(
-                "translation_invalid_response", "Google returned no translated text"
-            )
-        return translated
-
-
 class TranslationService:
     """Translate source articles through a provider chain and persist every outcome."""
 
@@ -469,8 +410,6 @@ def build_translation_service(
             providers.append(LibreTranslateProvider(provider, client))
         elif provider.kind == "mymemory":
             providers.append(MyMemoryProvider(provider, client))
-        elif provider.kind == "google":
-            providers.append(GoogleProvider(provider))
         else:
             providers.append(OpenAICompatibleProvider(provider, client))
     return TranslationService(

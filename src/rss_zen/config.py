@@ -12,7 +12,7 @@ import yaml
 from pydantic import ValidationError
 
 from rss_zen.errors import ConfigurationError
-from rss_zen.models import AnySearchSettings, AppConfig, TranslationSettings
+from rss_zen.models import AnySearchSettings, AppConfig, FeedConfig, TranslationSettings
 
 
 def load_config(path: Path, *, environment: Mapping[str, str] | None = None) -> AppConfig:
@@ -30,14 +30,14 @@ def _read_config_file(path: Path) -> Mapping[str, object]:
         raise ConfigurationError(f"configuration file does not exist: {path}")
 
     try:
-        with path.open("rb") as handle:
-            if path.suffix.lower() == ".toml":
-                raw = tomllib.load(handle)
-            elif path.suffix.lower() in {".yaml", ".yml"}:
-                raw = yaml.safe_load(handle)
-            else:
-                raise ConfigurationError("configuration format must be TOML, YAML, or YML")
-    except (OSError, tomllib.TOMLDecodeError, yaml.YAMLError) as error:
+        content = path.read_text(encoding="utf-8-sig")
+        if path.suffix.lower() == ".toml":
+            raw = tomllib.loads(content)
+        elif path.suffix.lower() in {".yaml", ".yml"}:
+            raw = yaml.safe_load(content)
+        else:
+            raise ConfigurationError("configuration format must be TOML, YAML, or YML")
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError, yaml.YAMLError) as error:
         raise ConfigurationError(f"unable to read configuration: {error}", cause=error) from error
 
     if not isinstance(raw, Mapping):
@@ -54,8 +54,11 @@ def _resolve_secrets(config: AppConfig, environment: Mapping[str, str]) -> AppCo
     translation = TranslationSettings.model_validate(
         {**config.translation.model_dump(), "providers": providers}
     )
+    feeds = [_resolve_feed_headers(feed, environment) for feed in config.feeds]
     anysearch = _resolve_anysearch_secret(config.anysearch, environment)
-    return config.model_copy(update={"translation": translation, "anysearch": anysearch})
+    return config.model_copy(
+        update={"translation": translation, "feeds": feeds, "anysearch": anysearch}
+    )
 
 
 def _required_secret(name: str | None, environment: Mapping[str, str]) -> str | None:
@@ -65,6 +68,21 @@ def _required_secret(name: str | None, environment: Mapping[str, str]) -> str | 
     if not value:
         raise ConfigurationError(f"required environment variable is missing: {name}")
     return value
+
+
+def _resolve_feed_headers(
+    feed: FeedConfig, environment: Mapping[str, str]
+) -> FeedConfig:
+    """Resolve only explicitly declared sensitive feed headers from the environment."""
+    resolved_headers = dict(feed.headers)
+    for header_name, environment_name in feed.header_env.items():
+        value = environment.get(environment_name)
+        if not value:
+            raise ConfigurationError(
+                f"required environment variable is missing: {environment_name}"
+            )
+        resolved_headers[header_name] = value
+    return feed.model_copy(update={"resolved_headers": resolved_headers})
 
 
 def _resolve_anysearch_secret(

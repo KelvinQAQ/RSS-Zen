@@ -96,13 +96,16 @@ database and exports, for example `/var/lib/rss-zen/rss-zen.sqlite3` and
 `/var/lib/rss-zen/exports/daily.md`.
 
 ```bash
-sudo install -o root -g root -m 0644 rss-zen.toml /etc/rss-zen/rss-zen.toml
+sudo install -o root -g rss-zen -m 0640 rss-zen.toml /etc/rss-zen/rss-zen.toml
 sudo install -o root -g root -m 0600 deploy/systemd/rss-zen.env.example /etc/rss-zen/rss-zen.env
 sudoedit /etc/rss-zen/rss-zen.env
 ```
 
 All feeds and provider endpoints must use HTTPS. Private/loopback addresses and URLs with
-embedded credentials are rejected.
+embedded credentials are rejected. Feed `headers` accepts only non-secret, valid HTTP headers;
+use `header_env` for `Authorization` or `Cookie` so values remain in the root-owned credential
+file rather than TOML. The optional `curl` fetcher validates every redirect, permits HTTPS only,
+and applies the configured response-size limit.
 
 ## Install units
 
@@ -140,9 +143,11 @@ extraction remains manual and is never scheduled by `serve`.
 
 ## Backup and restore
 
-The backup timer runs daily at 02:30 and keeps the newest 30 verified backups under
-`/var/lib/rss-zen/backups`. A backup is generated through the SQLite backup API and checked
-with `PRAGMA integrity_check` before publication.
+The backup timer runs daily at 02:30 and writes verified snapshots to the `[backup].directory`
+configured in `/etc/rss-zen/rss-zen.toml` (by default `/var/lib/rss-zen/backups`). A backup is
+generated through the SQLite backup API and checked with `PRAGMA integrity_check` before
+publication. Retention applies both `[backup].retention_days` and `[backup].retention_count`;
+the newest successful backup is always retained.
 
 To restore a backup:
 

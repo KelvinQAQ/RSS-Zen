@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import time
 from collections.abc import Callable, Mapping
+from pathlib import Path
 from random import Random
 from urllib.parse import urljoin
 
@@ -168,7 +169,7 @@ class FeedHttpClient:
         initial_url = self._validate_url(url)
         for attempt in range(1, self._max_attempts + 1):
             try:
-                response = self._curl_once(initial_url, request_headers, timeout)
+                response = self._get_curl_once(initial_url, request_headers, timeout)
             except subprocess.TimeoutExpired as error:
                 if attempt == self._max_attempts:
                     raise AppError(
@@ -194,51 +195,92 @@ class FeedHttpClient:
             return response
         raise RuntimeError("unreachable retry loop")
 
-    def _curl_once(
+    def _get_curl_once(
         self, url: str, headers: Mapping[str, str], timeout: int
     ) -> httpx.Response:
-        with (
-            tempfile.NamedTemporaryFile() as body_file,
-            tempfile.NamedTemporaryFile() as header_file,
-        ):
+        """Fetch curl redirects manually so every destination is policy-validated."""
+        current_url = url
+        for redirect_count in range(self._max_redirects + 1):
+            response = self._curl_request(current_url, headers, timeout)
+            if not response.is_redirect:
+                return response
+            location = response.headers.get("Location")
+            if location is None:
+                raise AppError(
+                    "feed_redirect_invalid", "feed redirect did not include a Location header"
+                )
+            if redirect_count == self._max_redirects:
+                raise AppError("feed_redirect_limit", "feed exceeded the redirect limit")
+            current_url = self._validate_url(urljoin(current_url, location))
+        raise RuntimeError("unreachable curl redirect loop")
+
+    def _curl_request(
+        self, url: str, headers: Mapping[str, str], timeout: int
+    ) -> httpx.Response:
+        """Issue exactly one HTTPS curl request through a private temp directory."""
+        with tempfile.TemporaryDirectory(prefix="rss-zen-curl-") as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            body_path = temporary_path / "body"
+            header_path = temporary_path / "headers"
+            config_path = temporary_path / "curl.conf"
+            config_path.write_text(_curl_config(headers), encoding="utf-8")
             command = [
                 "curl",
+                "-q",
                 "-sS",
-                "-L",
+                "--config",
+                str(config_path),
                 "--http1.1",
+                "--proto",
+                "=https",
+                "--proto-redir",
+                "=https",
+                "--connect-timeout",
+                str(min(timeout, 15)),
                 "--max-time",
                 str(timeout),
+                "--max-filesize",
+                str(self._max_response_bytes),
                 "-o",
-                body_file.name,
+                str(body_path),
                 "-D",
-                header_file.name,
+                str(header_path),
                 "-w",
                 "%{http_code}",
+                url,
             ]
-            for key, value in headers.items():
-                command += ["-H", f"{key}: {value}"]
-            command.append(url)
             completed = subprocess.run(
                 command,
                 capture_output=True,
                 check=False,
                 timeout=timeout + 15,
             )
-            body = body_file.read()
-            header_bytes = header_file.read()
+            body = body_path.read_bytes() if body_path.exists() else b""
+            header_bytes = header_path.read_bytes() if header_path.exists() else b""
+        if completed.returncode:
+            raise AppError(
+                "feed_curl_error",
+                f"curl failed with exit status {completed.returncode}",
+                retryable=completed.returncode in {5, 6, 7, 28, 35, 52, 55, 56},
+            )
         try:
             status_code = int(completed.stdout.strip().splitlines()[-1])
-        except (ValueError, IndexError):
-            status_code = 0
+        except (ValueError, IndexError) as error:
+            raise AppError("feed_curl_error", "curl did not return an HTTP status") from error
         if len(body) > self._max_response_bytes:
             raise AppError(
                 "feed_response_too_large", "feed response exceeded the configured size limit"
             )
-        return httpx.Response(
-            status_code,
-            headers=_parse_curl_headers(header_bytes),
-            content=body,
-        )
+        return httpx.Response(status_code, headers=_parse_curl_headers(header_bytes), content=body)
+
+def _curl_config(headers: Mapping[str, str]) -> str:
+    """Render validated headers without exposing values in process arguments."""
+    lines = []
+    for name, value in headers.items():
+        escaped = f"{name}: {value}".replace("\\", "\\\\").replace('"', '\\"')
+        lines.append(f'header = "{escaped}"')
+    return "\n".join(lines) + "\n"
+
 
 def _backoff_seconds(attempt: int, random: Random) -> float:
     base = min(2 ** (attempt - 1), 30)
@@ -246,17 +288,17 @@ def _backoff_seconds(attempt: int, random: Random) -> float:
 
 
 def _parse_curl_headers(raw: bytes) -> httpx.Headers:
-    """Parse the final response header block written by ``curl -D``."""
-    blocks = raw.split(b"\n\n")
+    """Parse the final HTTP response header block written by ``curl -D``."""
+    normalized = raw.replace(b"\r\n", b"\n")
+    blocks = [block for block in normalized.split(b"\n\n") if block.startswith(b"HTTP/")]
     headers = httpx.Headers()
-    for line in (blocks[-1] if blocks else b"").splitlines():
+    for line in (blocks[-1] if blocks else b"").splitlines()[1:]:
         if b":" not in line:
             continue
         name, _, value = line.partition(b":")
-        name = name.decode("latin-1").strip()
-        if not name:
-            continue
-        headers[name] = value.decode("latin-1").strip()
+        decoded_name = name.decode("latin-1").strip()
+        if decoded_name:
+            headers[decoded_name] = value.decode("latin-1").strip()
     return headers
 
 

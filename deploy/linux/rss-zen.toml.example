@@ -15,6 +15,13 @@ max_feed_response_bytes = 10000000
 max_entries_per_feed = 500
 max_article_chars = 500000
 max_translation_chars = 100000
+max_extract_articles_per_run = 20
+max_translate_articles_per_run = 50
+
+[backup]
+directory = "/var/lib/rss-zen/backups"
+retention_days = 30
+retention_count = 30
 
 [translation]
 target_language = "zh-CN"

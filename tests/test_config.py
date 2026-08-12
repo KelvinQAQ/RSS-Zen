@@ -119,12 +119,24 @@ def test_loads_equivalent_toml_and_yaml_config(tmp_path: Path, filename: str, co
     assert config.anysearch.max_results == 3
     assert config.limits.max_feed_response_bytes == 10_000_000
     assert config.limits.max_entries_per_feed == 500
+    assert config.limits.max_extract_articles_per_run == 20
+    assert config.limits.max_translate_articles_per_run == 50
+    assert config.backup.directory == Path("backups")
+    assert config.backup.retention_days == 30
+    assert config.backup.retention_count == 30
     assert config.service.translation_max_attempts == 5
     assert config.translation.providers[0].api_key == "free-secret"
     ai_provider = config.translation.providers[1]
     assert ai_provider.reasoning_effort == "none"
     assert ai_provider.timeout_seconds == 120
     assert ai_provider.max_chars == 3000
+
+
+def test_loads_utf8_bom_config(tmp_path: Path) -> None:
+    config_path = tmp_path / "rss-zen.toml"
+    config_path.write_text(_toml_config(), encoding="utf-8-sig")
+
+    assert load_config(config_path).database.path == Path("data/rss-zen.sqlite3")
 
 
 def test_rejects_missing_database_path(tmp_path: Path) -> None:
@@ -225,4 +237,77 @@ def test_rejects_invalid_limits(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ConfigurationError, match="max_entries_per_feed"):
+        load_config(config_path)
+
+
+def test_rejects_invalid_backup_retention(tmp_path: Path) -> None:
+    config_path = tmp_path / "rss-zen.toml"
+    config_path.write_text(
+        _toml_config() + "\n[backup]\nretention_count = 0\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ConfigurationError, match="retention_count"):
+        load_config(config_path)
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        'headers = { Authorization = "Bearer secret" }',
+        'headers = { "Bad Header" = "value" }',
+        'headers = { "X-Test" = "line\\nfeed" }',
+        'headers = { Host = "example.test" }',
+    ],
+)
+def test_rejects_unsafe_direct_feed_headers(tmp_path: Path, header: str) -> None:
+    config_path = tmp_path / "rss-zen.toml"
+    config_path.write_text(
+        _toml_config()
+        + f'\n[[feeds]]\nname = "Other"\nurl = "https://other.test/rss"\n{header}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigurationError, match="header"):
+        load_config(config_path)
+
+
+def test_resolves_sensitive_feed_header_from_environment(tmp_path: Path) -> None:
+    config_path = tmp_path / "rss-zen.toml"
+    config_path.write_text(
+        _toml_config()
+        + """
+[[feeds]]
+name = "Private"
+url = "https://private.example.test/rss"
+header_env = { Authorization = "PRIVATE_FEED_TOKEN" }
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path, environment={
+        "FREE_TRANSLATION_API_KEY": "free-secret",
+        "AI_TRANSLATION_API_KEY": "ai-secret",
+        "PRIVATE_FEED_TOKEN": "Bearer private-token",
+    })
+
+    private = config.feeds[-1]
+    assert private.headers == {}
+    assert private.resolved_headers == {"Authorization": "Bearer private-token"}
+    assert "private-token" not in private.model_dump_json()
+
+
+def test_rejects_missing_sensitive_feed_header_environment(tmp_path: Path) -> None:
+    config_path = tmp_path / "rss-zen.toml"
+    config_path.write_text(
+        _toml_config()
+        + """
+[[feeds]]
+name = "Private"
+url = "https://private.example.test/rss"
+header_env = { Cookie = "PRIVATE_FEED_COOKIE" }
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigurationError, match="PRIVATE_FEED_COOKIE"):
         load_config(config_path)

@@ -62,11 +62,15 @@ uv run rss-zen sync --config rss-zen.toml
 uv run rss-zen sync --source "Example feed" --config rss-zen.toml
 
 # Retry translation for selected already-synchronized articles.
+# Manual batches are bounded by [limits]; use --limit to lower/override it,
+# and --dry-run to inspect selection without provider calls.
 uv run rss-zen translate --article-id 42 --config rss-zen.toml
+uv run rss-zen translate --status failed --limit 20 --dry-run --config rss-zen.toml
 
 # Explicit full-text retrieval; no extraction happens during normal sync.
+# Extraction batches are also bounded by [limits].
 uv run rss-zen extract --article-id 42 --config rss-zen.toml
-uv run rss-zen extract --source "Example feed" --without-extraction --config rss-zen.toml
+uv run rss-zen extract --source "Example feed" --without-extraction --limit 20 --config rss-zen.toml
 
 # Render a named Markdown profile.
 # --since/--until override the profile's time filters without editing config.
@@ -113,7 +117,11 @@ should use the supplied `systemd` units.
   stored as full text.
 
 Translation and AnySearch requests send article content to the configured third
-party. Select providers according to your privacy and retention requirements.
+party. Select providers according to your privacy and retention requirements. Feed URLs use
+HTTPS and reject private resolved addresses; the optional curl fetcher validates every redirect
+and writes sensitive headers only to a private temporary curl configuration. Place ordinary
+headers in `headers`; configure `Authorization` and `Cookie` only via `header_env` and environment
+credentials.
 
 ## Export Profiles
 
@@ -152,6 +160,8 @@ Supported preprocessor operations are `strip_html`, `collapse_whitespace`,
 ```bash
 uv run ruff check .
 uv run pytest -q
+uv run pip-audit
+uv run python scripts/check_text_encoding.py
 ```
 
 Tests use local RSS/Atom fixtures and mocked HTTP transports. They never call

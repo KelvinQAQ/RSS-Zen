@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-import shutil
 import sqlite3
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+
+from rss_zen.backup import create_verified_sqlite_snapshot
 
 
 @dataclass(frozen=True)
@@ -344,6 +345,7 @@ _MIGRATIONS: tuple[tuple[int, str], ...] = (
     (2, _MIGRATION_2),
     (3, _MIGRATION_3),
 )
+_PRE_MIGRATION_BACKUP_RETENTION_COUNT = 10
 
 
 class Database:
@@ -355,7 +357,7 @@ class Database:
         self.busy_timeout_ms = 10_000
 
     def initialize(self) -> None:
-        """Apply outstanding schema migrations transactionally."""
+        """Apply outstanding schema migrations with verified pre-migration snapshots."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connection() as connection:
             connection.execute(
@@ -370,15 +372,25 @@ class Database:
 
         pending = [(version, sql) for version, sql in _MIGRATIONS if version > current_version]
         if pending and current_version > 0 and self.path.exists():
-            self._backup_before_migration()
+            self._backup_before_migration(current_version, pending[-1][0])
 
+        for version, sql in pending:
+            self._apply_migration(version, sql)
+
+    def _apply_migration(self, version: int, sql: str) -> None:
+        """Apply one migration and its version record in one SQLite transaction."""
         with self._connection() as connection:
-            for version, sql in pending:
-                connection.executescript(sql)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                _execute_sql_script(connection, sql)
                 connection.execute(
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                     (version, _utc_now()),
                 )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
 
     def schema_version(self) -> int:
         """Return the last applied schema migration version."""
@@ -1142,10 +1154,31 @@ class Database:
         ).fetchone()
         return int(row["version"])
 
-    def _backup_before_migration(self) -> None:
-        timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-        backup_path = self.path.with_suffix(f"{self.path.suffix}.{timestamp}.bak")
-        shutil.copy2(self.path, backup_path)
+    def _backup_before_migration(self, from_version: int, to_version: int) -> Path:
+        """Snapshot committed main-database and WAL state before schema changes."""
+        backup_directory = self.path.parent / "backups" / "pre-migration"
+        timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+        backup_path = backup_directory / (
+            f"rss-zen-v{from_version}-to-v{to_version}-{timestamp}.sqlite3"
+        )
+        create_verified_sqlite_snapshot(self.path, backup_path)
+        backups = sorted(backup_directory.glob("rss-zen-v*-to-v*-*.sqlite3"), reverse=True)
+        for obsolete in backups[_PRE_MIGRATION_BACKUP_RETENTION_COUNT:]:
+            obsolete.unlink()
+        return backup_path
+
+
+def _execute_sql_script(connection: sqlite3.Connection, script: str) -> None:
+    """Execute a semicolon-delimited migration without executescript's implicit commit."""
+    statement = ""
+    for line in script.splitlines(keepends=True):
+        statement += line
+        if sqlite3.complete_statement(statement):
+            if statement.strip():
+                connection.execute(statement)
+            statement = ""
+    if statement.strip():
+        raise ValueError("migration SQL ended with an incomplete statement")
 
 
 def _article_values(

@@ -211,7 +211,7 @@ seed_deployment_source() {
 install_configuration_templates() {
   log "Step 5/8: Preserve or create production configuration"
   if [[ ! -e "${CONFIG_PATH}" ]]; then
-    install -o root -g root -m 0644 \
+    install -o root -g "${SERVICE_USER}" -m 0640 \
       "${PROJECT_DIR}/deploy/linux/rss-zen.toml.example" "${CONFIG_PATH}"
     warn "Created ${CONFIG_PATH}; edit provider settings and add HTTPS feeds."
   else

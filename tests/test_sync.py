@@ -160,6 +160,94 @@ def test_curl_fetcher_parses_final_redirect_headers(tmp_path: Path) -> None:
     assert headers["content-type"] == "application/rss+xml"
 
 
+def test_curl_fetcher_validates_each_redirect_and_rejects_private_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import subprocess
+
+    import rss_zen.http_client as http_client_module
+
+    def fake_curl(command: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+        header_path = Path(command[command.index("-D") + 1])
+        header_path.write_text(
+            "HTTP/1.1 302 Found\r\nLocation: https://private.test/feed.xml\r\n\r\n"
+        )
+        return subprocess.CompletedProcess(command, 0, stdout=b"302", stderr=b"")
+
+    monkeypatch.setattr(http_client_module.subprocess, "run", fake_curl)
+    client = FeedHttpClient(
+        httpx.Client(),
+        policy=FeedUrlPolicy(
+            resolver=lambda host, _port: (
+                ("93.184.216.34",) if host == "public.test" else ("127.0.0.1",)
+            )
+        ),
+    )
+
+    with pytest.raises(AppError, match="non-public"):
+        client.get_feed_curl("https://public.test/feed.xml", {})
+
+
+def test_curl_fetcher_disables_automatic_redirects_and_hides_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import subprocess
+
+    import rss_zen.http_client as http_client_module
+
+    captured: dict[str, object] = {}
+
+    def fake_curl(command: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+        captured["command"] = command
+        config_path = Path(command[command.index("--config") + 1])
+        captured["config"] = config_path.read_text(encoding="utf-8")
+        body_path = Path(command[command.index("-o") + 1])
+        header_path = Path(command[command.index("-D") + 1])
+        body_path.write_bytes(b"feed")
+        header_path.write_text("HTTP/1.1 200 OK\r\n\r\n")
+        return subprocess.CompletedProcess(command, 0, stdout=b"200", stderr=b"")
+
+    monkeypatch.setattr(http_client_module.subprocess, "run", fake_curl)
+    FeedHttpClient(httpx.Client()).get_feed_curl(
+        "https://example.test/feed.xml", {"Authorization": "Bearer private"}
+    )
+
+    command = captured["command"]
+    assert isinstance(command, list)
+    assert "-L" not in command
+    assert command[command.index("--proto") : command.index("--proto") + 2] == [
+        "--proto",
+        "=https",
+    ]
+    assert command[
+        command.index("--proto-redir") : command.index("--proto-redir") + 2
+    ] == ["--proto-redir", "=https"]
+    assert "--max-filesize" in command
+    assert "Bearer private" not in " ".join(command)
+    assert "Bearer private" in captured["config"]
+
+
+def test_curl_fetcher_maps_nonzero_exit_to_retryable_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    import subprocess
+
+    import rss_zen.http_client as http_client_module
+
+    monkeypatch.setattr(
+        http_client_module.subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command, 28, stdout=b"", stderr=b"timeout"
+        ),
+    )
+    client = FeedHttpClient(httpx.Client(), max_attempts=1)
+
+    with pytest.raises(AppError) as excinfo:
+        client.get_feed_curl("https://example.test/feed.xml", {})
+
+    assert excinfo.value.code == "feed_curl_error"
+    assert excinfo.value.retryable is True
+
+
 def test_sync_decodes_gzip_encoded_feed(tmp_path: Path) -> None:
     import gzip
 
