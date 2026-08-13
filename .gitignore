@@ -12,6 +12,9 @@ htmlcov/
 # Local test and tooling state
 .test-tmp/
 .codewhale/
+# Runtime project-development tracking data. The skill implementation is tracked
+# under .pi/skills/, but state/events/reports/backups are always local only.
+.pi/project-management/
 *.sqlite3
 *.sqlite3-*
 # uv.lock IS committed (reproducible builds)
