@@ -23,6 +23,7 @@ from rss_zen.http_client import FeedHttpClient
 from rss_zen.logging import configure_logging
 from rss_zen.models import AppConfig
 from rss_zen.network import FeedUrlPolicy
+from rss_zen.reporting import REPORT_SCHEMA_VERSION, write_json_report
 from rss_zen.runtime import single_instance_lock
 from rss_zen.scheduler import FeedScheduler
 from rss_zen.sync import FeedSyncService
@@ -86,6 +87,86 @@ def _parse_time_bound(value: str | None) -> str | None:
 
 def _json_echo(payload: object) -> None:
     typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+
+
+def _write_batch_report(path: Path | None, report: dict[str, object]) -> None:
+    """Write an optional batch report, with ``-`` denoting stdout."""
+    if path is None:
+        return
+    if str(path) == "-":
+        _json_echo(report)
+        return
+    write_json_report(path, report)
+
+
+def _execution_report(
+    command: str,
+    *,
+    selected_articles: int,
+    completed_articles: int,
+    failed_articles: int,
+    budget: RunBudget,
+    skipped: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    """Build an exact report from provider-boundary budget accounting."""
+    summary = budget.summary()
+    skipped_items = skipped or []
+    return {
+        "schema_version": REPORT_SCHEMA_VERSION,
+        "command": command,
+        "dry_run": False,
+        "estimate_only": False,
+        "selected_articles": selected_articles,
+        "completed_articles": completed_articles,
+        "failed_articles": failed_articles,
+        "skipped_articles": len(skipped_items),
+        "source_chars": summary["source_chars"],
+        "provider_requests": summary["provider_requests"],
+        "limits": {
+            "source_chars": summary["max_source_chars"],
+            "provider_requests": summary["max_provider_requests"],
+        },
+        "skipped": skipped_items,
+    }
+
+
+def _dry_run_report(command: str, articles: list[object], config: AppConfig) -> dict[str, object]:
+    """Produce a network-free lower-bound estimate for selected source records."""
+    source_chars = sum(
+        len(value)
+        for article in articles
+        for value in (article.title, article.summary, article.content)
+        if value
+    )
+    estimated_requests = sum(
+        sum(value is not None for value in (article.title, article.summary, article.content))
+        for article in articles
+    )
+    if command == "extract":
+        source_chars = sum(len(article.canonical_url) for article in articles)
+        estimated_requests = len(articles)
+    return {
+        "schema_version": REPORT_SCHEMA_VERSION,
+        "command": command,
+        "dry_run": True,
+        "estimate_only": True,
+        "selected_articles": len(articles),
+        "completed_articles": 0,
+        "failed_articles": 0,
+        "skipped_articles": 0,
+        "source_chars": source_chars,
+        "provider_requests": estimated_requests,
+        "limits": {
+            "articles": (
+                config.limits.max_translate_articles_per_run
+                if command == "translate"
+                else config.limits.max_extract_articles_per_run
+            ),
+            "source_chars": config.limits.max_source_chars_per_run,
+            "provider_requests": config.limits.max_provider_requests_per_run,
+        },
+        "skipped": [],
+    }
 
 
 @app.command()
@@ -219,6 +300,9 @@ def translate(
     dry_run: bool = typer.Option(
         False, "--dry-run", help="List selected articles without calling providers."
     ),
+    report_json: Path | None = typer.Option(
+        None, "--report-json", help="Write a JSON report; use - for stdout."
+    ),
     config_path: Path = typer.Option(Path("rss-zen.toml"), "--config", "-c"),
 ) -> None:
     """Retry translation for explicitly selected source articles."""
@@ -255,6 +339,7 @@ def translate(
         if dry_run:
             for article in articles:
                 typer.echo(f"article_id={article.id} title={article.title}")
+            _write_batch_report(report_json, _dry_run_report("translate", articles, config))
             typer.echo(f"selected={len(articles)} dry_run=true")
             return
         budget = RunBudget(
@@ -270,17 +355,40 @@ def translate(
                 max_backoff_minutes=config.service.retry_max_backoff_minutes,
                 budget=budget,
             )
-            outcomes = [
-                service.translate_article(article, force=True)
-                for article in articles
-            ]
+            outcomes = []
+            budget_error: AppError | None = None
+            skipped: list[dict[str, object]] = []
+            for index, article in enumerate(articles):
+                try:
+                    outcomes.append(service.translate_article(article, force=True))
+                except AppError as error:
+                    if error.code != "provider_budget_exhausted":
+                        raise
+                    budget_error = error
+                    skipped = [
+                        {"article_id": item.id, "reason": error.code}
+                        for item in articles[index:]
+                    ]
+                    break
     except AppError as error:
         _handle_app_error(error)
         return
-    failures = 0
+    failures = sum(outcome.status != "succeeded" for outcome in outcomes)
+    _write_batch_report(
+        report_json,
+        _execution_report(
+            "translate",
+            selected_articles=len(articles),
+            completed_articles=len(outcomes) - failures,
+            failed_articles=failures,
+            budget=budget,
+            skipped=skipped,
+        ),
+    )
+    if budget_error is not None:
+        _handle_app_error(budget_error)
+        return
     for outcome in outcomes:
-        if outcome.status != "succeeded":
-            failures += 1
         typer.echo(
             f"article_id={outcome.article_id} status={outcome.status} "
             f"provider={outcome.provider_name}"
@@ -325,6 +433,9 @@ def extract(
     dry_run: bool = typer.Option(
         False, "--dry-run", help="List selected articles without calling providers."
     ),
+    report_json: Path | None = typer.Option(
+        None, "--report-json", help="Write a JSON report; use - for stdout."
+    ),
     config_path: Path = typer.Option(Path("rss-zen.toml"), "--config", "-c"),
 ) -> None:
     """Retrieve full text for selected articles."""
@@ -354,6 +465,7 @@ def extract(
         if dry_run:
             for article in articles:
                 typer.echo(f"article_id={article.id} title={article.title}")
+            _write_batch_report(report_json, _dry_run_report("extract", articles, config))
             typer.echo(f"selected={len(articles)} dry_run=true")
             return
         budget = RunBudget(
@@ -374,15 +486,41 @@ def extract(
                 AnySearchExtractor(config.anysearch, client, budget=budget),
                 translator=translator,
             )
-            results = service.extract_articles(articles)
+            results = []
+            budget_error: AppError | None = None
+            skipped: list[dict[str, object]] = []
+            for index, article in enumerate(articles):
+                try:
+                    results.extend(service.extract_articles([article]))
+                except AppError as error:
+                    if error.code != "provider_budget_exhausted":
+                        raise
+                    budget_error = error
+                    skipped = [
+                        {"article_id": item.id, "reason": error.code}
+                        for item in articles[index:]
+                    ]
+                    break
     except AppError as error:
         _handle_app_error(error)
         return
 
-    failures = 0
+    failures = sum(result.status != "succeeded" for result in results)
+    _write_batch_report(
+        report_json,
+        _execution_report(
+            "extract",
+            selected_articles=len(articles),
+            completed_articles=len(results) - failures,
+            failed_articles=failures,
+            budget=budget,
+            skipped=skipped,
+        ),
+    )
+    if budget_error is not None:
+        _handle_app_error(budget_error)
+        return
     for result in results:
-        if result.status != "succeeded":
-            failures += 1
         typer.echo(
             f"article_id={result.article_id} status={result.status}"
             + (f" error={result.error_code}" if result.error_code else "")

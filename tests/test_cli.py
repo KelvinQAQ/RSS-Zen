@@ -299,6 +299,102 @@ target_language = "zh-CN"
     assert "provider" in result.stdout
 
 
+def test_translate_writes_report_before_budget_exhaustion(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("FREE_TRANSLATION_API_KEY", "free-secret")
+    config_path = tmp_path / "rss-zen.toml"
+    config_path.write_text(
+        """
+[database]
+path = "rss-zen.sqlite3"
+
+[limits]
+max_provider_requests_per_run = 1
+max_source_chars_per_run = 100
+
+[translation]
+target_language = "zh-CN"
+
+[[translation.providers]]
+name = "free"
+kind = "libretranslate"
+endpoint = "https://translate.example.test/translate"
+api_key_env = "FREE_TRANSLATION_API_KEY"
+""",
+        encoding="utf-8",
+    )
+    from rss_zen.db import ArticleInput, Database, FeedInput
+
+    database = Database(tmp_path / "rss-zen.sqlite3")
+    database.initialize()
+    feed = database.upsert_feed(FeedInput(name="Example", url="https://example.test/feed.xml"))
+    article = database.reconcile_article(
+        feed.id,
+        ArticleInput(
+            guid="a1",
+            canonical_url="https://example.test/one",
+            title="One",
+            summary="Two",
+            content=None,
+            author=None,
+            categories=(),
+            published_at=None,
+        ),
+    ).article
+    second = database.reconcile_article(
+        feed.id,
+        ArticleInput(
+            guid="a2",
+            canonical_url="https://example.test/two",
+            title="Three",
+            summary="Four",
+            content=None,
+            author=None,
+            categories=(),
+            published_at=None,
+        ),
+    ).article
+
+    class FakeService:
+        called = False
+
+        def translate_article(self, record, *, force=False):
+            from rss_zen.errors import AppError
+            from rss_zen.translation import TranslationOutcome
+
+            if not self.called:
+                self.called = True
+                return TranslationOutcome(record.id, "succeeded", "free")
+            raise AppError("provider_budget_exhausted", "provider request budget is exhausted")
+
+    monkeypatch.setattr("rss_zen.cli.build_translation_service", lambda *a, **k: FakeService())
+    report_path = tmp_path / "reports" / "budget.json"
+
+    result = runner.invoke(
+        app,
+        [
+            "translate",
+            "--article-id",
+            str(article.id),
+            "--article-id",
+            str(second.id),
+            "--report-json",
+            str(report_path),
+            "--config",
+            str(config_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "provider_budget_exhausted" in result.stderr
+    import json as _json
+
+    report = _json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["completed_articles"] == 1
+    assert report["skipped_articles"] == 1
+    assert report["skipped"][0]["reason"] == "provider_budget_exhausted"
+    assert report["skipped"][0]["article_id"] in {article.id, second.id}
+
+
 def test_translate_retries_failed_articles_by_status(tmp_path, monkeypatch) -> None:
     """--status failed selects failed articles and re-translates them."""
     monkeypatch.setenv("FREE_TRANSLATION_API_KEY", "free-secret")
@@ -377,3 +473,30 @@ url = "https://example.test/feed.xml"
     assert result.exit_code == 0
     assert called == [article.id]
     assert f"article_id={article.id} status=succeeded" in result.stdout
+
+    report_path = tmp_path / "reports" / "translate.json"
+    dry_run = runner.invoke(
+        app,
+        [
+            "translate",
+            "--status",
+            "failed",
+            "--dry-run",
+            "--report-json",
+            str(report_path),
+            "--config",
+            str(config_path),
+        ],
+    )
+
+    assert dry_run.exit_code == 0
+    assert called == [article.id]
+    import json as _json
+
+    report = _json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["schema_version"] == 1
+    assert report["command"] == "translate"
+    assert report["dry_run"] is True
+    assert report["selected_articles"] == 1
+    assert report["estimate_only"] is True
+    assert not list(report_path.parent.glob("*.tmp"))

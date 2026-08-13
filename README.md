@@ -67,11 +67,13 @@ uv run rss-zen sync --source "Example feed" --config rss-zen.toml
 # and --dry-run to inspect selection without provider calls.
 uv run rss-zen translate --article-id 42 --config rss-zen.toml
 uv run rss-zen translate --status failed --limit 20 --dry-run --config rss-zen.toml
+uv run rss-zen translate --status failed --report-json reports/translate.json --config rss-zen.toml
 
 # Explicit full-text retrieval; no extraction happens during normal sync.
 # Extraction batches are also bounded by [limits].
 uv run rss-zen extract --article-id 42 --config rss-zen.toml
 uv run rss-zen extract --source "Example feed" --without-extraction --limit 20 --config rss-zen.toml
+uv run rss-zen extract --source "Example feed" --report-json - --config rss-zen.toml
 
 # Render a named Markdown profile.
 # --since/--until override the profile's time filters without editing config.
@@ -116,6 +118,10 @@ should use the supplied `systemd` units.
   URL as the query. RSS-Zen only accepts a result whose normalized URL exactly
   matches the source article, preventing unrelated search content from being
   stored as full text.
+
+`translate` and `extract` can write a versioned, atomic JSON run report with `--report-json`
+(`-` emits it to stdout). Runtime reports include exact provider request/source-character
+consumption; dry-run reports are explicitly marked as estimates.
 
 Translation and AnySearch requests send article content to the configured third
 party. Select providers according to your privacy and retention requirements. Feed URLs use
