@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodic RSS-Zen local health contract check
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+Unit=rss-zen-healthcheck.service
+
+[Install]
+WantedBy=timers.target

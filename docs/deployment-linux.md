@@ -136,6 +136,23 @@ sudo -u rss-zen /usr/local/bin/rss-zen status --config /etc/rss-zen/rss-zen.toml
 sudo systemctl list-timers 'rss-zen-*'
 ```
 
+### Optional local health-check timer
+
+The health-check timer is intentionally **not enabled by the installer**. It runs only the local
+`rss-zen doctor --json` contract and does not contact feeds/providers or restart the service. Enable
+it when systemd/journald failure state is already monitored by your alerting system:
+
+```bash
+sudo install -m 0644 deploy/systemd/rss-zen-healthcheck.service /etc/systemd/system/
+sudo install -m 0644 deploy/systemd/rss-zen-healthcheck.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now rss-zen-healthcheck.timer
+sudo journalctl -u rss-zen-healthcheck.service -f
+```
+
+A warning-only doctor result exits 0. Any doctor error exits 1, causing the oneshot unit to fail
+for observability; it does not restart `rss-zen.service`.
+
 `SIGTERM` and `SIGINT` stop scheduling new work and allow active bounded requests to finish;
 `TimeoutStopSec=120s` bounds shutdown. Feed synchronization retries transient fetches, while
 translation retries are persisted in SQLite with bounded exponential backoff. AnySearch

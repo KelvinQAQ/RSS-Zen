@@ -7,6 +7,7 @@ def test_systemd_assets_use_non_root_service_and_absolute_commands() -> None:
     service = Path("deploy/systemd/rss-zen.service").read_text(encoding="utf-8")
     export_service = Path("deploy/systemd/rss-zen-export@.service").read_text(encoding="utf-8")
     backup_service = Path("deploy/systemd/rss-zen-backup.service").read_text(encoding="utf-8")
+    health_service = Path("deploy/systemd/rss-zen-healthcheck.service").read_text(encoding="utf-8")
 
     assert "User=rss-zen" in service
     assert (
@@ -33,16 +34,25 @@ def test_systemd_assets_use_non_root_service_and_absolute_commands() -> None:
         "--config /etc/rss-zen/rss-zen.toml"
     ) in backup_service
     assert "--backup-directory" not in backup_service
+    assert "User=rss-zen" in health_service
+    assert (
+        "/opt/rss-zen/current/.venv/bin/rss-zen doctor --json "
+        "--config /etc/rss-zen/rss-zen.toml"
+    ) in health_service
+    assert "Restart=" not in health_service
 
 
 def test_timers_are_persistent_and_use_expected_units() -> None:
     export_timer = Path("deploy/systemd/rss-zen-export-daily.timer").read_text(encoding="utf-8")
     backup_timer = Path("deploy/systemd/rss-zen-backup.timer").read_text(encoding="utf-8")
+    health_timer = Path("deploy/systemd/rss-zen-healthcheck.timer").read_text(encoding="utf-8")
 
     assert "Persistent=true" in export_timer
     assert "Unit=rss-zen-export@daily.service" in export_timer
     assert "Persistent=true" in backup_timer
     assert "Unit=rss-zen-backup.service" in backup_timer
+    assert "Persistent=true" in health_timer
+    assert "Unit=rss-zen-healthcheck.service" in health_timer
 
 
 def test_linux_documentation_covers_install_restore_and_single_instance_limit() -> None:

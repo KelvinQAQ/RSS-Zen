@@ -92,9 +92,11 @@ uv run rss-zen list --since 2d --config rss-zen.toml
 uv run rss-zen list --source "Example feed" --status succeeded --limit 20 --config rss-zen.toml
 
 # Inspect local feed and processing state without network access.
-# --json emits machine-readable structured output.
+# --json emits the additive Health Contract v1 (schema_version, database/WAL,
+# disk, backups, feed/batch aggregates, processing counts, and safe error totals).
 uv run rss-zen status --config rss-zen.toml
 uv run rss-zen status --json --config rss-zen.toml
+uv run rss-zen doctor --json --config rss-zen.toml
 
 # Start the foreground polling service.
 uv run rss-zen serve --config rss-zen.toml --verbose
@@ -127,6 +129,11 @@ should use the supplied `systemd` units.
 `translate` and `extract` can write a versioned, atomic JSON run report with `--report-json`
 (`-` emits it to stdout). Runtime reports include exact provider request/source-character
 consumption; dry-run reports are explicitly marked as estimates.
+
+`status --json` and `doctor --json` are local-only Health Contract v1 interfaces. Their
+`schema_version` changes only for a breaking JSON contract change; fields may be added within a
+version. `doctor` exits 0 for ok/warning checks and 1 when any check is an error, making it safe
+for systemd or external alerting without contacting feeds/providers.
 
 Translation and AnySearch requests send article content to the configured third
 party. Select providers according to your privacy and retention requirements. Feed URLs use
