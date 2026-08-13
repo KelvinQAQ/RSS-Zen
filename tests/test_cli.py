@@ -151,6 +151,68 @@ api_key_env = "FREE_TRANSLATION_API_KEY"
     assert payload["backups"]["newest"] is None
 
 
+def test_status_json_marks_overdue_and_malformed_timestamps_stale(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("FREE_TRANSLATION_API_KEY", "free-secret")
+    config_path = tmp_path / "rss-zen.toml"
+    config_path.write_text(
+        """
+[database]
+path = "rss-zen.sqlite3"
+
+[service]
+default_poll_interval_minutes = 30
+
+[translation]
+target_language = "zh-CN"
+
+[[translation.providers]]
+name = "free"
+kind = "libretranslate"
+endpoint = "https://translate.example.test/translate"
+api_key_env = "FREE_TRANSLATION_API_KEY"
+
+[[feeds]]
+name = "Overdue"
+url = "https://overdue.example.test/rss"
+poll_interval_minutes = 10
+
+[[feeds]]
+name = "Malformed"
+url = "https://malformed.example.test/rss"
+""",
+        encoding="utf-8",
+    )
+    from rss_zen.db import Database, FeedInput
+
+    database = Database(tmp_path / "rss-zen.sqlite3")
+    database.initialize()
+    overdue = database.upsert_feed(
+        FeedInput(
+            name="Overdue", url="https://overdue.example.test/rss", poll_interval_minutes=10
+        )
+    )
+    malformed = database.upsert_feed(FeedInput(name="Malformed", url="https://malformed.example.test/rss"))
+    database.record_feed_success(overdue.id, etag=None, last_modified=None)
+    database.record_feed_success(malformed.id, etag=None, last_modified=None)
+    with database._connection() as connection:
+        connection.execute(
+            "UPDATE feeds SET last_success_at = ? WHERE id = ?",
+            ("not-a-timestamp", malformed.id),
+        )
+        connection.execute(
+            "UPDATE feeds SET last_success_at = ? WHERE id = ?",
+            ("2000-01-01T00:00:00+00:00", overdue.id),
+        )
+
+    result = runner.invoke(app, ["status", "--json", "--config", str(config_path)])
+
+    assert result.exit_code == 0
+    import json as _json
+
+    payload = _json.loads(result.stdout)
+    assert payload["feed_health"]["stale"] == 2
+
+
 def test_list_command_runs(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("FREE_TRANSLATION_API_KEY", "free-secret")
     config_path = tmp_path / "rss-zen.toml"
@@ -369,6 +431,40 @@ api_key_env = "FREE_TRANSLATION_API_KEY"
     assert checks["database"]["status"] == "ok"
     assert "database_storage" in checks
     assert "batches" in checks
+
+
+def test_doctor_checks_curl_only_when_configured(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("FREE_TRANSLATION_API_KEY", "free-secret")
+    monkeypatch.setattr("rss_zen.cli.shutil.which", lambda _name: None)
+    config_path = tmp_path / "rss-zen.toml"
+    config_path.write_text(
+        """
+[database]
+path = "rss-zen.sqlite3"
+
+[translation]
+target_language = "zh-CN"
+
+[[translation.providers]]
+name = "free"
+kind = "libretranslate"
+endpoint = "https://translate.example.test/translate"
+api_key_env = "FREE_TRANSLATION_API_KEY"
+
+[[feeds]]
+name = "Curl feed"
+url = "https://example.test/rss"
+fetcher = "curl"
+""",
+        encoding="utf-8",
+    )
+    result = runner.invoke(app, ["doctor", "--json", "--config", str(config_path)])
+
+    assert result.exit_code == 1
+    import json as _json
+
+    checks = {check["check"]: check for check in _json.loads(result.stdout)["checks"]}
+    assert checks["curl"]["status"] == "error"
 
 
 def test_doctor_never_creates_missing_database(tmp_path, monkeypatch) -> None:

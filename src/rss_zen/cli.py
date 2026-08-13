@@ -884,7 +884,26 @@ def doctor(
                     f"env {config.anysearch.api_key_env} is not set; extraction will fail",
                 )
 
-    # 3. Database file and integrity (without initializing/creating).
+    # 3. Local configuration metadata and curl prerequisite.
+    if config is not None:
+        try:
+            mode = config_path.stat().st_mode & 0o777
+            _check(
+                "config_permissions",
+                "warning" if mode & 0o007 else "ok",
+                f"mode {mode:04o}" + (" is world-readable" if mode & 0o007 else ""),
+            )
+        except OSError as error:
+            _check("config_permissions", "warning", f"cannot inspect mode: {error}")
+        if any(feed.fetcher == "curl" for feed in config.feeds):
+            curl_path = shutil.which("curl")
+            _check(
+                "curl",
+                "ok" if curl_path else "error",
+                "curl executable is available" if curl_path else "curl executable not found",
+            )
+
+    # 4. Database file and integrity (without initializing/creating).
     database: Database | None = None
     database_path = (
         config_path.parent / config.database.path
@@ -926,7 +945,7 @@ def doctor(
             except sqlite3.Error as error:
                 _check("database", "error", f"cannot open database: {error}")
 
-    # 4. Feed and processing health from the repository (only when initialized).
+    # 5. Feed and processing health from the repository (only when initialized).
     if database is not None:
         try:
             feeds = database.list_feeds()
@@ -971,7 +990,7 @@ def doctor(
         except sqlite3.Error as error:
             _check("repository", "error", f"cannot read repository state: {error}")
 
-    # 5. Backup freshness.
+    # 6. Backup freshness.
     backup_directory = (
         _resolve_config_path(config.backup.directory, config_path)
         if config is not None
@@ -1002,6 +1021,8 @@ def doctor(
                 "checks": checks,
             }
         )
+        if error_count:
+            raise typer.Exit(code=1)
         return
     for check in checks:
         status = check["status"]
@@ -1058,6 +1079,16 @@ def status(
         )
         backup_directory = _resolve_config_path(config.backup.directory, config_path)
         filesystem = _health_filesystem_snapshot(database.path, backup_directory)
+        health_now = datetime.now(UTC)
+        stale_feeds = [
+            feed
+            for feed in enabled_feeds
+            if _is_feed_stale(
+                feed,
+                default_poll_interval_minutes=config.service.default_poll_interval_minutes,
+                now=health_now,
+            )
+        ]
         batch_counts = database.batch_health_counts()
         _json_echo(
             {
@@ -1075,7 +1106,7 @@ def status(
                     "never_succeeded": sum(
                         1 for feed in enabled_feeds if feed.last_success_at is None
                     ),
-                    "stale": sum(1 for feed in enabled_feeds if feed.last_success_at is None),
+                    "stale": len(stale_feeds),
                 },
                 "batches": {
                     "running": batch_counts.running,
@@ -1142,6 +1173,21 @@ def status(
         )
     for error in errors:
         typer.echo(f"{error.workflow}_error={error.error_code} count={error.count}")
+
+
+def _is_feed_stale(
+    feed: object, *, default_poll_interval_minutes: int, now: datetime
+) -> bool:
+    """Return whether an enabled feed has never succeeded or missed two poll windows."""
+    last_success = feed.last_success_at
+    if last_success is None:
+        return True
+    try:
+        timestamp = datetime.fromisoformat(last_success).astimezone(UTC)
+    except (TypeError, ValueError):
+        return True
+    interval = feed.poll_interval_minutes or default_poll_interval_minutes
+    return now - timestamp > timedelta(minutes=interval * 2)
 
 
 def _health_filesystem_snapshot(database_path: Path, backup_directory: Path) -> dict[str, object]:
