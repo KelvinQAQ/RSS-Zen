@@ -45,6 +45,11 @@ def main() -> None:
             ["git", "check-ignore", "-q", ".pi/project-management/state.json"], cwd=root
         )
         assert ignored.returncode == 0
+        run(root, "reset", "--yes", "--name", "After Reset")
+        reset_status = json.loads(run(root, "status", "--format", "json"))
+        assert reset_status["name"] == "After Reset"
+        assert reset_status["counts"]["done"] == 0
+        assert any((root / ".pi/project-management/backups").glob("pre-reset-*.json"))
     print("project-development-management self-test passed")
 
 

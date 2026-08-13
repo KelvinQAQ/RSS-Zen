@@ -194,6 +194,10 @@ and then decide whether to resume, review, or create a new task.
 ## Recovery
 
 ```bash
+# Reset only tracking data after creating a pre-reset local snapshot.
+# Source code, branches, commits, and application databases are untouched.
+python3 .pi/skills/project-development-management/scripts/pdm.py reset --yes
+
 # List automatic local snapshots.
 python3 .pi/skills/project-development-management/scripts/pdm.py backup list
 

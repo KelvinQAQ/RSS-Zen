@@ -284,6 +284,23 @@ def cmd_backup(args: argparse.Namespace) -> None:
     event("backup.restore", {"file": source.name}, "user"); print(source.name)
 
 
+def cmd_reset(args: argparse.Namespace) -> None:
+    """Reset only local tracking state after creating an explicit local snapshot."""
+    if not args.yes:
+        raise ValueError("reset requires --yes")
+    p = paths()
+    with locked_state() as (state, mark):
+        p["backups"].mkdir(parents=True, exist_ok=True)
+        snapshot = p["backups"] / f"pre-reset-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}.json"
+        atomic_json(snapshot, state)
+        project_name = args.name or state.get("name", "Untitled Project")
+        state.clear()
+        state.update(default_state(project_name))
+        mark()
+    event("project.reset", {"backup": snapshot.name}, "user")
+    print(snapshot.name)
+
+
 def cmd_doctor(_args: argparse.Namespace) -> None:
     p = paths(); issues: list[str] = []
     try:
@@ -301,6 +318,7 @@ def parser() -> argparse.ArgumentParser:
     q = sub.add_parser("init"); q.add_argument("--name"); q.set_defaults(func=cmd_init)
     q = sub.add_parser("status"); q.add_argument("--format", choices=["text", "agent", "json"], default="text"); q.set_defaults(func=cmd_status)
     q = sub.add_parser("doctor"); q.set_defaults(func=cmd_doctor)
+    q = sub.add_parser("reset"); q.add_argument("--yes", action="store_true"); q.add_argument("--name"); q.set_defaults(func=cmd_reset)
     q = sub.add_parser("task"); ts = q.add_subparsers(dest="action", required=True)
     for a in ["create", "start", "status", "finish", "note", "link-commit", "show", "list"]:
         x = ts.add_parser(a); x.add_argument("id", nargs="?"); x.add_argument("--title"); x.add_argument("--description"); x.add_argument("--acceptance"); x.add_argument("--milestone"); x.add_argument("--priority", choices=PRIORITIES, default="medium"); x.add_argument("--depends-on"); x.add_argument("--branch"); x.add_argument("--note"); x.add_argument("--text"); x.add_argument("--commit"); x.add_argument("--status", choices=TASK_STATES); x.add_argument("--force", action="store_true"); x.set_defaults(func=cmd_task)
