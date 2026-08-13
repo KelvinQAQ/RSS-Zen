@@ -12,6 +12,7 @@ import httpx
 import typer
 
 from rss_zen.backup import backup_database
+from rss_zen.budget import RunBudget
 from rss_zen.config import load_config
 from rss_zen.db import Database
 from rss_zen.errors import AppError, ConfigurationError
@@ -256,6 +257,10 @@ def translate(
                 typer.echo(f"article_id={article.id} title={article.title}")
             typer.echo(f"selected={len(articles)} dry_run=true")
             return
+        budget = RunBudget(
+            max_requests=config.limits.max_provider_requests_per_run,
+            max_source_chars=config.limits.max_source_chars_per_run,
+        )
         with httpx.Client(timeout=30.0) as client:
             service = build_translation_service(
                 database,
@@ -263,6 +268,7 @@ def translate(
                 client,
                 max_attempts=config.service.translation_max_attempts,
                 max_backoff_minutes=config.service.retry_max_backoff_minutes,
+                budget=budget,
             )
             outcomes = [
                 service.translate_article(article, force=True)
@@ -350,6 +356,10 @@ def extract(
                 typer.echo(f"article_id={article.id} title={article.title}")
             typer.echo(f"selected={len(articles)} dry_run=true")
             return
+        budget = RunBudget(
+            max_requests=config.limits.max_provider_requests_per_run,
+            max_source_chars=config.limits.max_source_chars_per_run,
+        )
         with httpx.Client(timeout=30.0) as client:
             translator = build_translation_service(
                 database,
@@ -357,10 +367,11 @@ def extract(
                 client,
                 max_attempts=config.service.translation_max_attempts,
                 max_backoff_minutes=config.service.retry_max_backoff_minutes,
+                budget=budget,
             )
             service = ExtractionService(
                 database,
-                AnySearchExtractor(config.anysearch, client),
+                AnySearchExtractor(config.anysearch, client, budget=budget),
                 translator=translator,
             )
             results = service.extract_articles(articles)

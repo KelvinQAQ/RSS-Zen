@@ -9,6 +9,7 @@ from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 import httpx
 
+from rss_zen.budget import RunBudget
 from rss_zen.db import ArticleRecord, Database, ExtractionInput
 from rss_zen.errors import AppError
 from rss_zen.models import AnySearchSettings
@@ -49,9 +50,16 @@ class ExtractionOutcome:
 class AnySearchExtractor:
     """Use the documented `/v1/search` endpoint as a conservative URL extractor."""
 
-    def __init__(self, settings: AnySearchSettings, client: httpx.Client) -> None:
+    def __init__(
+        self,
+        settings: AnySearchSettings,
+        client: httpx.Client,
+        *,
+        budget: RunBudget | None = None,
+    ) -> None:
         self._settings = settings
         self._client = client
+        self._budget = budget
 
     def extract(self, source_url: str) -> ExtractionResponse:
         """Search for a URL and accept only a response with the exact canonical URL."""
@@ -68,6 +76,8 @@ class AnySearchExtractor:
             payload["zone"] = self._settings.zone
         if self._settings.language is not None:
             payload["language"] = self._settings.language
+        if self._budget is not None:
+            self._budget.reserve(source_chars=len(canonical_url))
         try:
             response = self._client.post(
                 f"{self._settings.base_url}/v1/search", headers=headers, json=payload
@@ -147,6 +157,8 @@ class ExtractionService:
             try:
                 response = self._extractor.extract(article.canonical_url)
             except AppError as error:
+                if error.code == "provider_budget_exhausted":
+                    raise
                 self._database.record_extraction(
                     ExtractionInput(
                         article_id=article.id,
@@ -170,6 +182,8 @@ class ExtractionService:
                     else None
                 )
             except AppError as error:
+                if error.code == "provider_budget_exhausted":
+                    raise
                 self._database.record_extraction(
                     ExtractionInput(
                         article_id=article.id,

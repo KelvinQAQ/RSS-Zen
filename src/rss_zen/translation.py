@@ -11,6 +11,7 @@ from typing import Protocol
 import httpx
 from langdetect import DetectorFactory, LangDetectException, detect
 
+from rss_zen.budget import RunBudget
 from rss_zen.db import ArticleRecord, Database, TranslationInput
 from rss_zen.errors import AppError
 from rss_zen.models import TranslationProviderConfig, TranslationSettings
@@ -57,13 +58,20 @@ class TextTranslation:
 class LibreTranslateProvider:
     """Adapter for a LibreTranslate-compatible HTTP endpoint."""
 
-    def __init__(self, config: TranslationProviderConfig, client: httpx.Client) -> None:
+    def __init__(
+        self,
+        config: TranslationProviderConfig,
+        client: httpx.Client,
+        *,
+        budget: RunBudget | None = None,
+    ) -> None:
         self.name = config.name
         self.model = None
         self._endpoint = config.endpoint
         self._api_key = config.api_key
         self._timeout = config.timeout_seconds
         self._client = client
+        self._budget = budget
 
     def translate(self, text: str, source_language: str | None, target_language: str) -> str:
         payload: dict[str, str] = {
@@ -74,6 +82,7 @@ class LibreTranslateProvider:
         }
         if self._api_key:
             payload["api_key"] = self._api_key
+        _reserve_provider_request(self._budget, text)
         try:
             response = self._client.post(self._endpoint, json=payload, timeout=self._timeout)
         except httpx.TimeoutException as error:
@@ -108,7 +117,13 @@ class OpenAICompatibleProvider:
 
     _default_max_chars = 4000
 
-    def __init__(self, config: TranslationProviderConfig, client: httpx.Client) -> None:
+    def __init__(
+        self,
+        config: TranslationProviderConfig,
+        client: httpx.Client,
+        *,
+        budget: RunBudget | None = None,
+    ) -> None:
         self.name = config.name
         self.model = config.model
         self._endpoint = _chat_completions_url(config.endpoint)
@@ -117,6 +132,7 @@ class OpenAICompatibleProvider:
         self._timeout = config.timeout_seconds
         self._max_chars = config.max_chars or self._default_max_chars
         self._client = client
+        self._budget = budget
 
     def translate(self, text: str, source_language: str | None, target_language: str) -> str:
         chunks = _split_text_chunks(text, max_chars=self._max_chars)
@@ -150,6 +166,7 @@ class OpenAICompatibleProvider:
         }
         if self._reasoning_effort:
             payload["reasoning_effort"] = self._reasoning_effort
+        _reserve_provider_request(self._budget, text)
         try:
             response = self._client.post(
                 self._endpoint, headers=headers, json=payload, timeout=self._timeout
@@ -185,12 +202,19 @@ class OpenAICompatibleProvider:
 class MyMemoryProvider:
     """Adapter for MyMemory's anonymous, rate-limited translation endpoint."""
 
-    def __init__(self, config: TranslationProviderConfig, client: httpx.Client) -> None:
+    def __init__(
+        self,
+        config: TranslationProviderConfig,
+        client: httpx.Client,
+        *,
+        budget: RunBudget | None = None,
+    ) -> None:
         self.name = config.name
         self.model = None
         self._endpoint = config.endpoint
         self._timeout = config.timeout_seconds
         self._client = client
+        self._budget = budget
 
     def translate(self, text: str, source_language: str | None, target_language: str) -> str:
         chunks = _split_mymemory_text(text)
@@ -203,6 +227,7 @@ class MyMemoryProvider:
         self, text: str, source_language: str | None, target_language: str
     ) -> str:
         language_pair = f"{source_language or 'autodetect'}|{_mymemory_language(target_language)}"
+        _reserve_provider_request(self._budget, text)
         try:
             response = self._client.get(
                 self._endpoint,
@@ -402,16 +427,17 @@ def build_translation_service(
     max_attempts: int = 5,
     max_backoff_minutes: int = 360,
     max_translation_chars: int = 100_000,
+    budget: RunBudget | None = None,
 ) -> TranslationService:
     """Build configured adapters in declared priority order."""
     providers: list[TranslationProvider] = []
     for provider in settings.providers:
         if provider.kind == "libretranslate":
-            providers.append(LibreTranslateProvider(provider, client))
+            providers.append(LibreTranslateProvider(provider, client, budget=budget))
         elif provider.kind == "mymemory":
-            providers.append(MyMemoryProvider(provider, client))
+            providers.append(MyMemoryProvider(provider, client, budget=budget))
         else:
-            providers.append(OpenAICompatibleProvider(provider, client))
+            providers.append(OpenAICompatibleProvider(provider, client, budget=budget))
     return TranslationService(
         database,
         providers,
@@ -453,6 +479,12 @@ def _translate_fields(
             else None
         )
     return values[0], values[1], values[2]
+
+
+def _reserve_provider_request(budget: RunBudget | None, text: str) -> None:
+    """Reserve one outbound provider request immediately before sending it."""
+    if budget is not None:
+        budget.reserve(source_chars=len(text))
 
 
 def _libre_language(language: str) -> str:

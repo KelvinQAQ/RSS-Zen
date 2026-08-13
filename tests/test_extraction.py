@@ -5,7 +5,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
+import pytest
 
+from rss_zen.budget import RunBudget
 from rss_zen.db import ArticleInput, Database, FeedInput
 from rss_zen.extraction import AnySearchExtractor, ExtractionResponse, ExtractionService
 from rss_zen.models import AnySearchSettings
@@ -70,6 +72,27 @@ def test_anysearch_posts_documented_request_and_requires_exact_url_match() -> No
 
     assert result.content == "Full article body"
     assert result.request_id == "request-1"
+
+
+def test_anysearch_budget_rejects_before_http_call() -> None:
+    calls = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"code": 0, "data": {"results": []}})
+
+    extractor = AnySearchExtractor(
+        AnySearchSettings(),
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        budget=RunBudget(max_requests=1, max_source_chars=1),
+    )
+
+    with pytest.raises(Exception, match="character budget") as excinfo:
+        extractor.extract("https://example.test/articles/one")
+
+    assert excinfo.value.code == "provider_budget_exhausted"
+    assert calls == 0
 
 
 @dataclass

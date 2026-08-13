@@ -3,7 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import pytest
+
 from rss_zen.db import ArticleInput, Database, FeedInput
+from rss_zen.errors import AppError
 from rss_zen.translation import TranslationProviderError, TranslationService
 
 
@@ -186,6 +189,36 @@ def test_mymemory_adapter_splits_long_input_on_utf8_boundaries() -> None:
 
     assert provider.translate(source, "en", "zh-CN") == source.strip()
     assert len(requests) > 1
+
+
+def test_translation_budget_rejects_request_before_http_call() -> None:
+    import httpx
+
+    from rss_zen.budget import RunBudget
+    from rss_zen.models import TranslationProviderConfig
+    from rss_zen.translation import LibreTranslateProvider
+
+    calls = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"translatedText": "你好"})
+
+    provider = LibreTranslateProvider(
+        TranslationProviderConfig(
+            name="free", kind="libretranslate", endpoint="https://translate.example.test"
+        ),
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        budget=RunBudget(max_requests=1, max_source_chars=5),
+    )
+
+    assert provider.translate("hello", "en", "zh-CN") == "你好"
+    with pytest.raises(AppError, match="request budget") as excinfo:
+        provider.translate("x", "en", "zh-CN")
+
+    assert excinfo.value.code == "provider_budget_exhausted"
+    assert calls == 1
 
 
 def test_openai_compatible_sends_reasoning_effort_and_timeout() -> None:

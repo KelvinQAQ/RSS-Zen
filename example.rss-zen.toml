@@ -13,6 +13,8 @@ max_entries_per_feed = 500
 max_article_chars = 500000
 max_translation_chars = 100000
 # Guard against unexpected third-party API cost/volume in manual batches.
+max_provider_requests_per_run = 200
+max_source_chars_per_run = 500000
 max_extract_articles_per_run = 20
 max_translate_articles_per_run = 50
 
