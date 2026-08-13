@@ -156,15 +156,27 @@ def cmd_task(args: argparse.Namespace) -> None:
             s["tasks"][item["id"]] = item
             if args.milestone: s["milestones"][args.milestone]["task_ids"].append(item["id"])
             mark(); event("task.create", {"id": item["id"], "title": item["title"]}); print(item["id"]); return
+        if args.action == "list":
+            rows = [
+                v for v in s["tasks"].values()
+                if (not args.status or v["status"] == args.status)
+                and (not args.milestone or v["milestone_id"] == args.milestone)
+            ]
+            print("\n".join(
+                f"{x['id']} [{x['status']}/{x['priority']}] {x['title']}" for x in rows
+            ) or "(none)")
+            return
         task = require(s["tasks"], args.id, "task")
         if args.action == "start":
+
             unfinished = [i for i in task["depends_on"] if s["tasks"].get(i, {}).get("status") not in {"done", "cancelled"}]
             if unfinished and not args.force: raise ValueError(f"unfinished dependencies: {', '.join(unfinished)}")
             task["status"] = "in_progress"; task["branch"] = args.branch or git_info()["branch"]
         elif args.action == "status":
-            if args.status not in TASK_STATES: raise ValueError("invalid task status")
-            task["status"] = args.status
-            if args.status == "done": task["completed_at"] = now()
+            status = args.status_value or args.status
+            if status not in TASK_STATES: raise ValueError("invalid task status")
+            task["status"] = status
+            if status == "done": task["completed_at"] = now()
         elif args.action == "finish":
             task["status"] = "done"; task["completed_at"] = now()
             if args.commit: task["commits"].append(args.commit)
@@ -175,9 +187,6 @@ def cmd_task(args: argparse.Namespace) -> None:
             if not commit: raise ValueError("no git commit available")
             if commit not in task["commits"]: task["commits"].append(commit)
         elif args.action == "show": print(json.dumps(task, ensure_ascii=False, indent=2)); return
-        elif args.action == "list":
-            rows = [v for v in s["tasks"].values() if (not args.status or v["status"] == args.status) and (not args.milestone or v["milestone_id"] == args.milestone)]
-            print("\n".join(f"{x['id']} [{x['status']}/{x['priority']}] {x['title']}" for x in rows) or "(none)"); return
         if args.note: task["notes"].append({"ts": now(), "text": args.note})
         task["updated_at"] = now(); mark(); event(f"task.{args.action}", {"id": task["id"], "status": task["status"]}); print(task["id"])
 
@@ -321,7 +330,7 @@ def parser() -> argparse.ArgumentParser:
     q = sub.add_parser("reset"); q.add_argument("--yes", action="store_true"); q.add_argument("--name"); q.set_defaults(func=cmd_reset)
     q = sub.add_parser("task"); ts = q.add_subparsers(dest="action", required=True)
     for a in ["create", "start", "status", "finish", "note", "link-commit", "show", "list"]:
-        x = ts.add_parser(a); x.add_argument("id", nargs="?"); x.add_argument("--title"); x.add_argument("--description"); x.add_argument("--acceptance"); x.add_argument("--milestone"); x.add_argument("--priority", choices=PRIORITIES, default="medium"); x.add_argument("--depends-on"); x.add_argument("--branch"); x.add_argument("--note"); x.add_argument("--text"); x.add_argument("--commit"); x.add_argument("--status", choices=TASK_STATES); x.add_argument("--force", action="store_true"); x.set_defaults(func=cmd_task)
+        x = ts.add_parser(a); x.add_argument("id", nargs="?"); x.add_argument("status_value", nargs="?", choices=TASK_STATES); x.add_argument("--title"); x.add_argument("--description"); x.add_argument("--acceptance"); x.add_argument("--milestone"); x.add_argument("--priority", choices=PRIORITIES, default="medium"); x.add_argument("--depends-on"); x.add_argument("--branch"); x.add_argument("--note"); x.add_argument("--text"); x.add_argument("--commit"); x.add_argument("--status", choices=TASK_STATES); x.add_argument("--force", action="store_true"); x.set_defaults(func=cmd_task)
     q = sub.add_parser("milestone"); ms = q.add_subparsers(dest="action", required=True)
     for a in ["create", "status", "list"]:
         x = ms.add_parser(a); x.add_argument("id", nargs="?"); x.add_argument("status_value", nargs="?", choices=MILESTONE_STATES); x.add_argument("--title"); x.add_argument("--description"); x.add_argument("--exit-criteria"); x.add_argument("--status", choices=MILESTONE_STATES); x.set_defaults(func=cmd_milestone)
