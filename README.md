@@ -70,12 +70,15 @@ uv run rss-zen translate --status failed --limit 20 --dry-run --config rss-zen.t
 uv run rss-zen translate --status failed --report-json reports/translate.json --config rss-zen.toml
 # Per-run overrides may only lower the approved [limits] budget.
 uv run rss-zen translate --status failed --max-requests 20 --max-source-chars 100000 --config rss-zen.toml
+# Execution checkpoints are created by default; resume only unfinished work.
+uv run rss-zen translate --resume 12 --config rss-zen.toml
 
 # Explicit full-text retrieval; no extraction happens during normal sync.
 # Extraction batches are also bounded by [limits].
 uv run rss-zen extract --article-id 42 --config rss-zen.toml
 uv run rss-zen extract --source "Example feed" --without-extraction --limit 20 --config rss-zen.toml
 uv run rss-zen extract --source "Example feed" --report-json - --config rss-zen.toml
+uv run rss-zen extract --resume 12 --config rss-zen.toml
 
 # Render a named Markdown profile.
 # --since/--until override the profile's time filters without editing config.

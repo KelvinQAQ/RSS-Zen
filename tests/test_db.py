@@ -52,7 +52,7 @@ def _article(
 
 
 def test_initialization_creates_current_schema(database: Database) -> None:
-    assert database.schema_version() == 3
+    assert database.schema_version() == 4
     assert database.table_names() >= {
         "feeds",
         "articles",
@@ -102,7 +102,68 @@ def test_migration_snapshot_includes_uncheckpointed_wal_data(tmp_path: Path) -> 
     with sqlite3.connect(snapshots[0]) as snapshot:
         assert snapshot.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert snapshot.execute("SELECT name FROM feeds").fetchone()[0] == "Stored in WAL"
-    assert Database(database_path).schema_version() == 3
+    assert Database(database_path).schema_version() == 4
+
+
+def test_batch_run_materializes_ordered_article_selection(database: Database) -> None:
+    feed = database.upsert_feed(_feed())
+    first = database.reconcile_article(feed.id, _article()).article
+    second = database.reconcile_article(
+        feed.id,
+        _article(guid="article-2", canonical_url="https://example.test/articles/two"),
+    ).article
+
+    run = database.create_batch_run(
+        command="translate",
+        article_ids=(second.id, first.id),
+        selector={"article_ids": [second.id, first.id]},
+        limits={"provider_requests": 2},
+    )
+
+    assert run.command == "translate"
+    assert database.batch_run_pending_article_ids(run.id) == (second.id, first.id)
+
+
+def test_batch_run_tracks_item_and_run_lifecycle(database: Database) -> None:
+    feed = database.upsert_feed(_feed())
+    first = database.reconcile_article(feed.id, _article()).article
+    second = database.reconcile_article(
+        feed.id,
+        _article(guid="article-2", canonical_url="https://example.test/articles/two"),
+    ).article
+    run = database.create_batch_run(
+        command="translate",
+        article_ids=(first.id, second.id),
+        selector={"source": "Example feed"},
+        limits={"provider_requests": 2},
+    )
+
+    database.complete_batch_run_item(run.id, first.id, status="succeeded")
+    database.complete_batch_run_item(
+        run.id, second.id, status="skipped", error_code="provider_budget_exhausted"
+    )
+    database.update_batch_run_status(run.id, status="interrupted")
+
+    loaded = database.get_batch_run(run.id)
+    assert loaded.status == "interrupted"
+    assert loaded.selector == {"source": "Example feed"}
+    assert database.batch_run_resumable_article_ids(run.id) == (second.id,)
+
+
+def test_batch_run_rejects_unknown_id_and_wrong_command(database: Database) -> None:
+    feed = database.upsert_feed(_feed())
+    article = database.reconcile_article(feed.id, _article()).article
+    run = database.create_batch_run(
+        command="extract",
+        article_ids=(article.id,),
+        selector={},
+        limits={},
+    )
+
+    with pytest.raises(KeyError):
+        database.get_batch_run(999)
+    with pytest.raises(ValueError, match="command"):
+        database.require_batch_run_command(run.id, "translate")
 
 
 def test_upsert_feed_updates_existing_record(database: Database) -> None:

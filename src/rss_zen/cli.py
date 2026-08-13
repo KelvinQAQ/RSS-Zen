@@ -99,6 +99,16 @@ def _write_batch_report(path: Path | None, report: dict[str, object]) -> None:
     write_json_report(path, report)
 
 
+def _resume_batch_run(database: Database, run_id: int, command: str):
+    """Load a compatible checkpoint with safe CLI-facing error codes."""
+    try:
+        return database.require_batch_run_command(run_id, command)
+    except KeyError as error:
+        raise AppError("batch_run_not_found", f"batch run does not exist: {run_id}") from error
+    except ValueError as error:
+        raise AppError("invalid_batch_resume", str(error)) from error
+
+
 def _run_budget(
     config: AppConfig,
     *,
@@ -323,6 +333,8 @@ def translate(
         "--status",
         help="Retry all articles whose translation is pending or failed.",
     ),
+    resume: int | None = typer.Option(None, "--resume", min=1),
+    checkpoint: bool = typer.Option(True, "--checkpoint/--no-checkpoint"),
     limit: int | None = typer.Option(None, "--limit", min=1),
     dry_run: bool = typer.Option(
         False, "--dry-run", help="List selected articles without calling providers."
@@ -344,18 +356,32 @@ def translate(
         )
         return
     selected_ids = tuple(article_ids or [])
-    if not (selected_ids or source or status_filter):
+    has_selector = bool(selected_ids or source or status_filter)
+    if resume is not None and has_selector:
+        _handle_app_error(
+            AppError("invalid_resume_selector", "--resume cannot be combined with selectors")
+        )
+        return
+    if resume is None and not has_selector:
         _handle_app_error(
             AppError(
                 "translation_selector_required",
-                "select articles with --article-id, --source, or --status",
+                "select articles with --article-id, --source, --status, or --resume",
             )
         )
         return
     try:
         database, config = _database_from_config(config_path)
         effective_limit = limit or config.limits.max_translate_articles_per_run
-        if status_filter is not None:
+        batch_run = None
+        if resume is not None:
+            batch_run = _resume_batch_run(database, resume, "translate")
+            resumed_ids = database.batch_run_resumable_article_ids(resume)
+            articles_by_id = {
+                article_id: database.get_article(article_id) for article_id in resumed_ids
+            }
+            articles = [articles_by_id[article_id] for article_id in resumed_ids][:effective_limit]
+        elif status_filter is not None:
             articles = database.list_articles_by_translation_status(
                 config.translation.target_language, status=status_filter, limit=effective_limit
             )
@@ -368,6 +394,19 @@ def translate(
         budget = _run_budget(
             config, max_requests=max_requests, max_source_chars=max_source_chars
         )
+        if resume is not None and not checkpoint:
+            raise AppError("invalid_resume_checkpoint", "--resume requires checkpointing")
+        if not dry_run and batch_run is None and checkpoint:
+            batch_run = database.create_batch_run(
+                command="translate",
+                article_ids=tuple(article.id for article in articles),
+                selector={
+                    "article_ids": [article.id for article in articles],
+                    "source": source,
+                    "status": status_filter,
+                },
+                limits=budget.summary(),
+            )
         if dry_run:
             for article in articles:
                 typer.echo(f"article_id={article.id} title={article.title}")
@@ -390,7 +429,15 @@ def translate(
             skipped: list[dict[str, object]] = []
             for index, article in enumerate(articles):
                 try:
-                    outcomes.append(service.translate_article(article, force=True))
+                    outcome = service.translate_article(article, force=True)
+                    outcomes.append(outcome)
+                    if batch_run is not None:
+                        database.complete_batch_run_item(
+                            batch_run.id,
+                            article.id,
+                            status="succeeded" if outcome.status == "succeeded" else "failed",
+                            error_code=outcome.error_code,
+                        )
                 except AppError as error:
                     if error.code != "provider_budget_exhausted":
                         raise
@@ -399,6 +446,15 @@ def translate(
                         {"article_id": item.id, "reason": error.code}
                         for item in articles[index:]
                     ]
+                    if batch_run is not None:
+                        for item in articles[index:]:
+                            database.complete_batch_run_item(
+                                batch_run.id,
+                                item.id,
+                                status="skipped",
+                                error_code=error.code,
+                            )
+                        database.update_batch_run_status(batch_run.id, status="interrupted")
                     break
     except AppError as error:
         _handle_app_error(error)
@@ -406,15 +462,22 @@ def translate(
     failures = sum(outcome.status != "succeeded" for outcome in outcomes)
     _write_batch_report(
         report_json,
-        _execution_report(
-            "translate",
-            selected_articles=len(articles),
-            completed_articles=len(outcomes) - failures,
-            failed_articles=failures,
-            budget=budget,
-            skipped=skipped,
-        ),
+        {
+            **_execution_report(
+                "translate",
+                selected_articles=len(articles),
+                completed_articles=len(outcomes) - failures,
+                failed_articles=failures,
+                budget=budget,
+                skipped=skipped,
+            ),
+            **({"batch_run_id": batch_run.id} if batch_run is not None else {}),
+        },
     )
+    if batch_run is not None and budget_error is None:
+        database.update_batch_run_status(
+            batch_run.id, status="succeeded" if failures == 0 else "failed"
+        )
     if budget_error is not None:
         _handle_app_error(budget_error)
         return
@@ -459,6 +522,8 @@ def extract(
         help="Only articles published before: a duration or ISO datetime.",
     ),
     without_extraction: bool = typer.Option(False, "--without-extraction"),
+    resume: int | None = typer.Option(None, "--resume", min=1),
+    checkpoint: bool = typer.Option(True, "--checkpoint/--no-checkpoint"),
     limit: int | None = typer.Option(None, "--limit", min=1),
     dry_run: bool = typer.Option(
         False, "--dry-run", help="List selected articles without calling providers."
@@ -472,31 +537,61 @@ def extract(
 ) -> None:
     """Retrieve full text for selected articles."""
     selected_ids = tuple(article_ids or [])
-    if not (selected_ids or source or without_extraction or since or until):
+    has_selector = bool(selected_ids or source or without_extraction or since or until)
+    if resume is not None and has_selector:
+        _handle_app_error(
+            AppError("invalid_resume_selector", "--resume cannot be combined with selectors")
+        )
+        return
+    if resume is None and not has_selector:
         _handle_app_error(
             AppError(
                 "extraction_selector_required",
                 "select articles with --article-id, --source, --since/--until, "
-                "or --without-extraction",
+                "--without-extraction, or --resume",
             )
         )
         return
     try:
         database, config = _database_from_config(config_path)
-        published_after = _parse_time_bound(since)
-        published_before = _parse_time_bound(until)
-        articles = database.list_articles(
-            article_ids=selected_ids,
-            source=source,
-            without_extraction=without_extraction,
-            published_after=published_after,
-            published_before=published_before,
-        )[: limit or config.limits.max_extract_articles_per_run]
+        effective_limit = limit or config.limits.max_extract_articles_per_run
+        batch_run = None
+        if resume is not None:
+            batch_run = _resume_batch_run(database, resume, "extract")
+            resumed_ids = database.batch_run_resumable_article_ids(resume)
+            articles = [database.get_article(article_id) for article_id in resumed_ids][
+                :effective_limit
+            ]
+        else:
+            published_after = _parse_time_bound(since)
+            published_before = _parse_time_bound(until)
+            articles = database.list_articles(
+                article_ids=selected_ids,
+                source=source,
+                without_extraction=without_extraction,
+                published_after=published_after,
+                published_before=published_before,
+            )[:effective_limit]
         if not articles:
             raise AppError("article_not_found", "no article matches the requested selector")
         budget = _run_budget(
             config, max_requests=max_requests, max_source_chars=max_source_chars
         )
+        if resume is not None and not checkpoint:
+            raise AppError("invalid_resume_checkpoint", "--resume requires checkpointing")
+        if not dry_run and batch_run is None and checkpoint:
+            batch_run = database.create_batch_run(
+                command="extract",
+                article_ids=tuple(article.id for article in articles),
+                selector={
+                    "article_ids": [article.id for article in articles],
+                    "source": source,
+                    "without_extraction": without_extraction,
+                    "since": since,
+                    "until": until,
+                },
+                limits=budget.summary(),
+            )
         if dry_run:
             for article in articles:
                 typer.echo(f"article_id={article.id} title={article.title}")
@@ -524,7 +619,16 @@ def extract(
             skipped: list[dict[str, object]] = []
             for index, article in enumerate(articles):
                 try:
-                    results.extend(service.extract_articles([article]))
+                    item_results = service.extract_articles([article])
+                    results.extend(item_results)
+                    if batch_run is not None:
+                        result = item_results[0]
+                        database.complete_batch_run_item(
+                            batch_run.id,
+                            article.id,
+                            status="succeeded" if result.status == "succeeded" else "failed",
+                            error_code=result.error_code,
+                        )
                 except AppError as error:
                     if error.code != "provider_budget_exhausted":
                         raise
@@ -533,6 +637,15 @@ def extract(
                         {"article_id": item.id, "reason": error.code}
                         for item in articles[index:]
                     ]
+                    if batch_run is not None:
+                        for item in articles[index:]:
+                            database.complete_batch_run_item(
+                                batch_run.id,
+                                item.id,
+                                status="skipped",
+                                error_code=error.code,
+                            )
+                        database.update_batch_run_status(batch_run.id, status="interrupted")
                     break
     except AppError as error:
         _handle_app_error(error)
@@ -541,15 +654,22 @@ def extract(
     failures = sum(result.status != "succeeded" for result in results)
     _write_batch_report(
         report_json,
-        _execution_report(
-            "extract",
-            selected_articles=len(articles),
-            completed_articles=len(results) - failures,
-            failed_articles=failures,
-            budget=budget,
-            skipped=skipped,
-        ),
+        {
+            **_execution_report(
+                "extract",
+                selected_articles=len(articles),
+                completed_articles=len(results) - failures,
+                failed_articles=failures,
+                budget=budget,
+                skipped=skipped,
+            ),
+            **({"batch_run_id": batch_run.id} if batch_run is not None else {}),
+        },
     )
+    if batch_run is not None and budget_error is None:
+        database.update_batch_run_status(
+            batch_run.id, status="succeeded" if failures == 0 else "failed"
+        )
     if budget_error is not None:
         _handle_app_error(budget_error)
         return

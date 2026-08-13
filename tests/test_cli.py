@@ -513,6 +513,257 @@ api_key_env = "FREE_TRANSLATION_API_KEY"
     assert report["skipped"][0]["article_id"] in {article.id, second.id}
 
 
+def test_translate_rejects_unknown_or_wrong_command_checkpoint(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("FREE_TRANSLATION_API_KEY", "free-secret")
+    config_path = tmp_path / "rss-zen.toml"
+    config_path.write_text(
+        """
+[database]
+path = "rss-zen.sqlite3"
+
+[translation]
+target_language = "zh-CN"
+
+[[translation.providers]]
+name = "free"
+kind = "libretranslate"
+endpoint = "https://translate.example.test/translate"
+api_key_env = "FREE_TRANSLATION_API_KEY"
+""",
+        encoding="utf-8",
+    )
+    from rss_zen.db import ArticleInput, Database, FeedInput
+
+    database = Database(tmp_path / "rss-zen.sqlite3")
+    database.initialize()
+    feed = database.upsert_feed(FeedInput(name="Example", url="https://example.test/feed.xml"))
+    article = database.reconcile_article(
+        feed.id,
+        ArticleInput(
+            guid="a1", canonical_url="https://example.test/one", title="One",
+            summary=None, content=None, author=None, categories=(), published_at=None,
+        ),
+    ).article
+    extract_run = database.create_batch_run(
+        command="extract", article_ids=(article.id,), selector={}, limits={}
+    )
+
+    unknown = runner.invoke(app, ["translate", "--resume", "999", "--config", str(config_path)])
+    wrong_command = runner.invoke(
+        app, ["translate", "--resume", str(extract_run.id), "--config", str(config_path)]
+    )
+
+    assert unknown.exit_code == 1
+    assert "batch_run_not_found" in unknown.stderr
+    assert "Traceback" not in unknown.stdout
+    assert wrong_command.exit_code == 1
+    assert "invalid_batch_resume" in wrong_command.stderr
+
+
+def test_translate_creates_checkpoint_and_reports_run_id(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("FREE_TRANSLATION_API_KEY", "free-secret")
+    config_path = tmp_path / "rss-zen.toml"
+    config_path.write_text(
+        """
+[database]
+path = "rss-zen.sqlite3"
+
+[translation]
+target_language = "zh-CN"
+
+[[translation.providers]]
+name = "free"
+kind = "libretranslate"
+endpoint = "https://translate.example.test/translate"
+api_key_env = "FREE_TRANSLATION_API_KEY"
+""",
+        encoding="utf-8",
+    )
+    from rss_zen.db import ArticleInput, Database, FeedInput
+
+    database = Database(tmp_path / "rss-zen.sqlite3")
+    database.initialize()
+    feed = database.upsert_feed(FeedInput(name="Example", url="https://example.test/feed.xml"))
+    article = database.reconcile_article(
+        feed.id,
+        ArticleInput(
+            guid="a1", canonical_url="https://example.test/one", title="One",
+            summary=None, content=None, author=None, categories=(), published_at=None,
+        ),
+    ).article
+
+    class FakeService:
+        def translate_article(self, record, *, force=False):
+            from rss_zen.translation import TranslationOutcome
+
+            return TranslationOutcome(record.id, "succeeded", "free")
+
+    monkeypatch.setattr("rss_zen.cli.build_translation_service", lambda *a, **k: FakeService())
+    report_path = tmp_path / "report.json"
+    result = runner.invoke(
+        app,
+        [
+            "translate", "--article-id", str(article.id), "--report-json", str(report_path),
+            "--config", str(config_path),
+        ],
+    )
+
+    assert result.exit_code == 0
+    import json as _json
+
+    report = _json.loads(report_path.read_text(encoding="utf-8"))
+    run_id = report["batch_run_id"]
+    assert database.get_batch_run(run_id).status == "succeeded"
+    assert database.batch_run_pending_article_ids(run_id) == ()
+
+    without_checkpoint = runner.invoke(
+        app,
+        [
+            "translate", "--article-id", str(article.id), "--no-checkpoint",
+            "--report-json", str(tmp_path / "no-checkpoint.json"), "--config", str(config_path),
+        ],
+    )
+    assert without_checkpoint.exit_code == 0
+    no_checkpoint = _json.loads((tmp_path / "no-checkpoint.json").read_text(encoding="utf-8"))
+    assert "batch_run_id" not in no_checkpoint
+
+
+def test_extract_resume_only_processes_unfinished_checkpoint_items(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("FREE_TRANSLATION_API_KEY", "free-secret")
+    config_path = tmp_path / "rss-zen.toml"
+    config_path.write_text(
+        """
+[database]
+path = "rss-zen.sqlite3"
+
+[translation]
+target_language = "zh-CN"
+
+[[translation.providers]]
+name = "free"
+kind = "libretranslate"
+endpoint = "https://translate.example.test/translate"
+api_key_env = "FREE_TRANSLATION_API_KEY"
+""",
+        encoding="utf-8",
+    )
+    from rss_zen.db import ArticleInput, Database, FeedInput
+    from rss_zen.extraction import ExtractionOutcome
+
+    database = Database(tmp_path / "rss-zen.sqlite3")
+    database.initialize()
+    feed = database.upsert_feed(FeedInput(name="Example", url="https://example.test/feed.xml"))
+    first = database.reconcile_article(
+        feed.id,
+        ArticleInput(
+            guid="first", canonical_url="https://example.test/first", title="First",
+            summary=None, content=None, author=None, categories=(), published_at=None,
+        ),
+    ).article
+    second = database.reconcile_article(
+        feed.id,
+        ArticleInput(
+            guid="second", canonical_url="https://example.test/second", title="Second",
+            summary=None, content=None, author=None, categories=(), published_at=None,
+        ),
+    ).article
+    run = database.create_batch_run(
+        command="extract", article_ids=(first.id, second.id), selector={}, limits={}
+    )
+    database.complete_batch_run_item(run.id, first.id, status="succeeded")
+    database.complete_batch_run_item(
+        run.id, second.id, status="skipped", error_code="provider_budget_exhausted"
+    )
+    database.update_batch_run_status(run.id, status="interrupted")
+
+    called: list[int] = []
+
+    class FakeExtractionService:
+        def extract_articles(self, articles):
+            called.extend(article.id for article in articles)
+            return [ExtractionOutcome(article.id, "succeeded") for article in articles]
+
+    monkeypatch.setattr(
+        "rss_zen.cli.ExtractionService", lambda *a, **k: FakeExtractionService()
+    )
+    result = runner.invoke(
+        app, ["extract", "--resume", str(run.id), "--config", str(config_path)]
+    )
+
+    assert result.exit_code == 0
+    assert called == [second.id]
+    assert database.get_batch_run(run.id).status == "succeeded"
+
+
+def test_translate_resume_only_processes_unfinished_checkpoint_items(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("FREE_TRANSLATION_API_KEY", "free-secret")
+    config_path = tmp_path / "rss-zen.toml"
+    config_path.write_text(
+        """
+[database]
+path = "rss-zen.sqlite3"
+
+[translation]
+target_language = "zh-CN"
+
+[[translation.providers]]
+name = "free"
+kind = "libretranslate"
+endpoint = "https://translate.example.test/translate"
+api_key_env = "FREE_TRANSLATION_API_KEY"
+""",
+        encoding="utf-8",
+    )
+    from rss_zen.db import ArticleInput, Database, FeedInput
+
+    database = Database(tmp_path / "rss-zen.sqlite3")
+    database.initialize()
+    feed = database.upsert_feed(FeedInput(name="Example", url="https://example.test/feed.xml"))
+    first = database.reconcile_article(
+        feed.id,
+        ArticleInput(
+            guid="first", canonical_url="https://example.test/first", title="First",
+            summary=None, content=None, author=None, categories=(), published_at=None,
+        ),
+    ).article
+    second = database.reconcile_article(
+        feed.id,
+        ArticleInput(
+            guid="second", canonical_url="https://example.test/second", title="Second",
+            summary=None, content=None, author=None, categories=(), published_at=None,
+        ),
+    ).article
+    run = database.create_batch_run(
+        command="translate",
+        article_ids=(first.id, second.id),
+        selector={"article_ids": [first.id, second.id]},
+        limits={},
+    )
+    database.complete_batch_run_item(run.id, first.id, status="succeeded")
+    database.complete_batch_run_item(
+        run.id, second.id, status="skipped", error_code="provider_budget_exhausted"
+    )
+    database.update_batch_run_status(run.id, status="interrupted")
+
+    called: list[int] = []
+
+    class FakeService:
+        def translate_article(self, record, *, force=False):
+            from rss_zen.translation import TranslationOutcome
+
+            called.append(record.id)
+            return TranslationOutcome(record.id, "succeeded", "free")
+
+    monkeypatch.setattr("rss_zen.cli.build_translation_service", lambda *a, **k: FakeService())
+    result = runner.invoke(
+        app, ["translate", "--resume", str(run.id), "--config", str(config_path)]
+    )
+
+    assert result.exit_code == 0
+    assert called == [second.id]
+    assert database.get_batch_run(run.id).status == "succeeded"
+
+
 def test_translate_retries_failed_articles_by_status(tmp_path, monkeypatch) -> None:
     """--status failed selects failed articles and re-translates them."""
     monkeypatch.setenv("FREE_TRANSLATION_API_KEY", "free-secret")

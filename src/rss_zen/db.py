@@ -182,6 +182,17 @@ class ExportRunRecord:
 
 
 @dataclass(frozen=True)
+class BatchRunRecord:
+    """A materialized explicit translate or extract batch."""
+
+    id: int
+    command: str
+    status: str
+    selector: Mapping[str, object]
+    limits: Mapping[str, object]
+
+
+@dataclass(frozen=True)
 class ExportArticleRecord:
     """Article data assembled for one Markdown export row."""
 
@@ -340,10 +351,36 @@ CREATE INDEX IF NOT EXISTS idx_translations_retry
 ON translations(status, terminal, next_retry_at);
 """
 
+_MIGRATION_4 = """
+CREATE TABLE batch_runs (
+    id INTEGER PRIMARY KEY,
+    command TEXT NOT NULL CHECK(command IN ('translate', 'extract')),
+    selector_json TEXT NOT NULL,
+    limits_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('running', 'interrupted', 'succeeded', 'failed')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT
+);
+CREATE TABLE batch_run_items (
+    batch_run_id INTEGER NOT NULL REFERENCES batch_runs(id) ON DELETE CASCADE,
+    article_id INTEGER NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending', 'succeeded', 'failed', 'skipped')),
+    error_code TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(batch_run_id, article_id),
+    UNIQUE(batch_run_id, position)
+);
+CREATE INDEX idx_batch_run_items_pending
+ON batch_run_items(batch_run_id, status, position);
+"""
+
 _MIGRATIONS: tuple[tuple[int, str], ...] = (
     (1, _MIGRATION_1),
     (2, _MIGRATION_2),
     (3, _MIGRATION_3),
+    (4, _MIGRATION_4),
 )
 _PRE_MIGRATION_BACKUP_RETENTION_COUNT = 10
 
@@ -1080,6 +1117,131 @@ class Database:
             ],
         ]
 
+    def create_batch_run(
+        self,
+        *,
+        command: str,
+        article_ids: tuple[int, ...],
+        selector: Mapping[str, object],
+        limits: Mapping[str, object],
+    ) -> BatchRunRecord:
+        """Persist an ordered, immutable selection before external batch work begins."""
+        if command not in {"translate", "extract"}:
+            raise ValueError("unsupported batch command")
+        if not article_ids or len(article_ids) != len(set(article_ids)):
+            raise ValueError("batch article IDs must be non-empty and unique")
+        now = _utc_now()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO batch_runs(
+                    command, selector_json, limits_json, status, created_at, updated_at
+                ) VALUES (?, ?, ?, 'running', ?, ?)
+                """,
+                (
+                    command,
+                    json.dumps(dict(selector), sort_keys=True),
+                    json.dumps(dict(limits), sort_keys=True),
+                    now,
+                    now,
+                ),
+            )
+            run_id = int(cursor.lastrowid)
+            connection.executemany(
+                """
+                INSERT INTO batch_run_items(batch_run_id, article_id, position, status, updated_at)
+                VALUES (?, ?, ?, 'pending', ?)
+                """,
+                [
+                    (run_id, article_id, position, now)
+                    for position, article_id in enumerate(article_ids)
+                ],
+            )
+        return BatchRunRecord(run_id, command, "running", dict(selector), dict(limits))
+
+    def get_batch_run(self, run_id: int) -> BatchRunRecord:
+        """Return one batch run or raise KeyError when it no longer exists."""
+        with self._connection() as connection:
+            row = connection.execute("SELECT * FROM batch_runs WHERE id = ?", (run_id,)).fetchone()
+        if row is None:
+            raise KeyError(run_id)
+        return _batch_run_from_row(row)
+
+    def require_batch_run_command(self, run_id: int, command: str) -> BatchRunRecord:
+        """Return a run only when it belongs to the command requesting resume."""
+        run = self.get_batch_run(run_id)
+        if run.command != command:
+            raise ValueError(
+                f"batch run {run_id} command is {run.command}, not {command}"
+            )
+        return run
+
+    def batch_run_pending_article_ids(self, run_id: int) -> tuple[int, ...]:
+        """Return pending items in their original materialized order."""
+        return self._batch_run_article_ids(run_id, statuses=("pending",))
+
+    def batch_run_resumable_article_ids(self, run_id: int) -> tuple[int, ...]:
+        """Return unfinished items eligible for explicit operator resume."""
+        return self._batch_run_article_ids(
+            run_id, statuses=("pending", "failed", "skipped"), resumable_skips_only=True
+        )
+
+    def _batch_run_article_ids(
+        self,
+        run_id: int,
+        *,
+        statuses: tuple[str, ...],
+        resumable_skips_only: bool = False,
+    ) -> tuple[int, ...]:
+        placeholders = ", ".join("?" for _ in statuses)
+        skipped_clause = (
+            "AND (status != 'skipped' OR error_code = 'provider_budget_exhausted')"
+            if resumable_skips_only
+            else ""
+        )
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT article_id FROM batch_run_items
+                WHERE batch_run_id = ? AND status IN ({placeholders}) {skipped_clause}
+                ORDER BY position
+                """,
+                (run_id, *statuses),
+            ).fetchall()
+        return tuple(int(row["article_id"]) for row in rows)
+
+    def complete_batch_run_item(
+        self, run_id: int, article_id: int, *, status: str, error_code: str | None = None
+    ) -> None:
+        """Record one terminal or interrupted item state after external work completes."""
+        if status not in {"succeeded", "failed", "skipped"}:
+            raise ValueError("invalid batch item status")
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE batch_run_items SET status = ?, error_code = ?, updated_at = ?
+                WHERE batch_run_id = ? AND article_id = ?
+                """,
+                (status, error_code, _utc_now(), run_id, article_id),
+            )
+        if cursor.rowcount != 1:
+            raise KeyError((run_id, article_id))
+
+    def update_batch_run_status(self, run_id: int, *, status: str) -> None:
+        """Set the aggregate batch state after its item transitions are persisted."""
+        if status not in {"running", "interrupted", "succeeded", "failed"}:
+            raise ValueError("invalid batch run status")
+        completed_at = _utc_now() if status in {"succeeded", "failed"} else None
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE batch_runs SET status = ?, updated_at = ?, completed_at = ? WHERE id = ?
+                """,
+                (status, _utc_now(), completed_at, run_id),
+            )
+        if cursor.rowcount != 1:
+            raise KeyError(run_id)
+
     def record_export_run(
         self,
         *,
@@ -1179,6 +1341,20 @@ def _execute_sql_script(connection: sqlite3.Connection, script: str) -> None:
             statement = ""
     if statement.strip():
         raise ValueError("migration SQL ended with an incomplete statement")
+
+
+def _batch_run_from_row(row: sqlite3.Row) -> BatchRunRecord:
+    selector = json.loads(str(row["selector_json"]))
+    limits = json.loads(str(row["limits_json"]))
+    if not isinstance(selector, dict) or not isinstance(limits, dict):
+        raise ValueError("batch run JSON metadata must be objects")
+    return BatchRunRecord(
+        id=int(row["id"]),
+        command=str(row["command"]),
+        status=str(row["status"]),
+        selector=selector,
+        limits=limits,
+    )
 
 
 def _article_values(
