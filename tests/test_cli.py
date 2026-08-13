@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from typer.testing import CliRunner
 
 from rss_zen.cli import app
@@ -239,6 +241,145 @@ api_key_env = "FREE_TRANSLATION_API_KEY"
 
     assert result.exit_code == 1
     assert "retention_not_configured" in result.stderr
+
+
+def test_retention_apply_creates_backup_before_deleting(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("FREE_TRANSLATION_API_KEY", "free-secret")
+    config_path = tmp_path / "rss-zen.toml"
+    config_path.write_text(
+        """
+[database]
+path = "rss-zen.sqlite3"
+
+[retention]
+articles_days = 1
+
+[backup]
+directory = "backups"
+
+[translation]
+target_language = "zh-CN"
+
+[[translation.providers]]
+name = "free"
+kind = "libretranslate"
+endpoint = "https://translate.example.test/translate"
+api_key_env = "FREE_TRANSLATION_API_KEY"
+""",
+        encoding="utf-8",
+    )
+    from rss_zen.db import ArticleInput, Database, FeedInput
+
+    database = Database(tmp_path / "rss-zen.sqlite3")
+    database.initialize()
+    feed = database.upsert_feed(FeedInput(name="Example", url="https://example.test/feed.xml"))
+    article = database.reconcile_article(
+        feed.id,
+        ArticleInput(
+            guid="old", canonical_url="https://example.test/old", title="Old",
+            summary=None, content=None, author=None, categories=(), published_at=None,
+        ),
+    ).article
+    with database._connection() as connection:
+        connection.execute(
+            "UPDATE articles SET last_seen_at = ? WHERE id = ?",
+            ("2000-01-01T00:00:00+00:00", article.id),
+        )
+
+    result = runner.invoke(app, ["retention", "apply", "--config", str(config_path)])
+
+    assert result.exit_code == 0
+    import json as _json
+
+    payload = _json.loads(result.stdout)
+    assert payload["dry_run"] is False
+    assert payload["articles"] == 1
+    assert Path(payload["backup"]).is_file()
+    assert database.retention_counts(articles_before="2100-01-01T00:00:00+00:00").articles == 0
+
+
+def test_retention_apply_does_not_delete_when_backup_fails(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("FREE_TRANSLATION_API_KEY", "free-secret")
+    config_path = tmp_path / "rss-zen.toml"
+    config_path.write_text(
+        """
+[database]
+path = "rss-zen.sqlite3"
+
+[retention]
+articles_days = 1
+
+[translation]
+target_language = "zh-CN"
+
+[[translation.providers]]
+name = "free"
+kind = "libretranslate"
+endpoint = "https://translate.example.test/translate"
+api_key_env = "FREE_TRANSLATION_API_KEY"
+""",
+        encoding="utf-8",
+    )
+    from rss_zen.db import ArticleInput, Database, FeedInput
+    from rss_zen.errors import AppError
+
+    database = Database(tmp_path / "rss-zen.sqlite3")
+    database.initialize()
+    feed = database.upsert_feed(FeedInput(name="Example", url="https://example.test/feed.xml"))
+    article = database.reconcile_article(
+        feed.id,
+        ArticleInput(
+            guid="old", canonical_url="https://example.test/old", title="Old",
+            summary=None, content=None, author=None, categories=(), published_at=None,
+        ),
+    ).article
+    with database._connection() as connection:
+        connection.execute(
+            "UPDATE articles SET last_seen_at = ? WHERE id = ?",
+            ("2000-01-01T00:00:00+00:00", article.id),
+        )
+
+    monkeypatch.setattr(
+        "rss_zen.cli.backup_database",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AppError("backup_failed", "backup failed")),
+    )
+    result = runner.invoke(app, ["retention", "apply", "--config", str(config_path)])
+
+    assert result.exit_code == 1
+    assert "backup_failed" in result.stderr
+    assert database.retention_counts(articles_before="2100-01-01T00:00:00+00:00").articles == 1
+
+
+def test_maintenance_checkpoint_reports_local_wal_result(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("FREE_TRANSLATION_API_KEY", "free-secret")
+    config_path = tmp_path / "rss-zen.toml"
+    config_path.write_text(
+        """
+[database]
+path = "rss-zen.sqlite3"
+
+[translation]
+target_language = "zh-CN"
+
+[[translation.providers]]
+name = "free"
+kind = "libretranslate"
+endpoint = "https://translate.example.test/translate"
+api_key_env = "FREE_TRANSLATION_API_KEY"
+""",
+        encoding="utf-8",
+    )
+    from rss_zen.db import Database
+
+    Database(tmp_path / "rss-zen.sqlite3").initialize()
+    result = runner.invoke(app, ["maintenance", "checkpoint", "--config", str(config_path)])
+
+    assert result.exit_code == 0
+    import json as _json
+
+    payload = _json.loads(result.stdout)
+    assert payload["action"] == "checkpoint"
+    assert set(payload) == {"action", "busy", "log_frames", "checkpointed_frames"}
 
 
 def test_list_command_runs(tmp_path, monkeypatch) -> None:

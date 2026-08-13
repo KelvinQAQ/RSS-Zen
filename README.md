@@ -80,6 +80,14 @@ uv run rss-zen extract --source "Example feed" --without-extraction --limit 20 -
 uv run rss-zen extract --source "Example feed" --report-json - --config rss-zen.toml
 uv run rss-zen extract --resume 12 --config rss-zen.toml
 
+# Retention is disabled unless [retention] is configured. Always preview first;
+# apply creates a verified backup before a single transactional deletion.
+uv run rss-zen retention --dry-run --config rss-zen.toml
+uv run rss-zen retention apply --config rss-zen.toml
+# SQLite maintenance is explicit and never scheduled by serve.
+uv run rss-zen maintenance checkpoint --config rss-zen.toml
+uv run rss-zen maintenance vacuum --config rss-zen.toml
+
 # Render a named Markdown profile.
 # --since/--until override the profile's time filters without editing config.
 # Accept a relative duration (2d, 12h, 1w) or an ISO datetime.

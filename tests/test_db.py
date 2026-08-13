@@ -157,6 +157,31 @@ def test_retention_preview_counts_only_configured_candidates(database: Database)
     assert database.retention_counts().articles == 0
 
 
+def test_retention_apply_deletes_only_completed_batch_runs(database: Database) -> None:
+    feed = database.upsert_feed(_feed())
+    article = database.reconcile_article(feed.id, _article()).article
+    completed = database.create_batch_run(
+        command="translate", article_ids=(article.id,), selector={}, limits={}
+    )
+    interrupted = database.create_batch_run(
+        command="extract", article_ids=(article.id,), selector={}, limits={}
+    )
+    database.update_batch_run_status(completed.id, status="succeeded")
+    database.update_batch_run_status(interrupted.id, status="interrupted")
+    with database._connection() as connection:
+        connection.execute(
+            "UPDATE batch_runs SET completed_at = ? WHERE id = ?",
+            ("2000-01-01T00:00:00+00:00", completed.id),
+        )
+
+    counts = database.apply_retention(batch_runs_before="2001-01-01T00:00:00+00:00")
+
+    assert counts.batch_runs == 1
+    with pytest.raises(KeyError):
+        database.get_batch_run(completed.id)
+    assert database.get_batch_run(interrupted.id).status == "interrupted"
+
+
 def test_batch_run_materializes_ordered_article_selection(database: Database) -> None:
     feed = database.upsert_feed(_feed())
     first = database.reconcile_article(feed.id, _article()).article

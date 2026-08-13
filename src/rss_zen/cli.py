@@ -689,15 +689,24 @@ def extract(
 
 @app.command()
 def retention(
+    action: str | None = typer.Argument(None),
     dry_run: bool = typer.Option(False, "--dry-run"),
     config_path: Path = typer.Option(Path("rss-zen.toml"), "--config", "-c"),
 ) -> None:
-    """Preview configured data-retention candidates; deletion is not implemented yet."""
-    if not dry_run:
+    """Preview configured retention or explicitly apply it after verified backup."""
+    if action not in {None, "apply"}:
+        _handle_app_error(AppError("invalid_retention_action", "action must be 'apply'"))
+        return
+    if action == "apply" and dry_run:
+        _handle_app_error(
+            AppError("invalid_retention_action", "apply cannot be combined with --dry-run")
+        )
+        return
+    if action is None and not dry_run:
         _handle_app_error(
             AppError(
                 "retention_apply_required",
-                "use 'rss-zen retention --dry-run' to preview candidates",
+                "use 'rss-zen retention --dry-run' or 'rss-zen retention apply'",
             )
         )
         return
@@ -718,24 +727,76 @@ def retention(
         def cutoff(days: int | None) -> str | None:
             return (now - timedelta(days=days)).isoformat() if days else None
 
-        counts = database.retention_counts(
-            articles_before=cutoff(settings.articles_days),
-            failed_extractions_before=cutoff(settings.failed_extractions_days),
-            export_runs_before=cutoff(settings.export_runs_days),
-            batch_runs_before=cutoff(settings.batch_runs_days),
-        )
+        arguments = {
+            "articles_before": cutoff(settings.articles_days),
+            "failed_extractions_before": cutoff(settings.failed_extractions_days),
+            "export_runs_before": cutoff(settings.export_runs_days),
+            "batch_runs_before": cutoff(settings.batch_runs_days),
+        }
+        if dry_run:
+            counts = database.retention_counts(**arguments)
+            backup_path = None
+        else:
+            backup_directory = _resolve_config_path(config.backup.directory, config_path)
+            backup_path = backup_database(
+                database.path,
+                backup_directory,
+                retention_days=config.backup.retention_days,
+                retention_count=config.backup.retention_count,
+            )
+            counts = database.apply_retention(**arguments)
     except AppError as error:
         _handle_app_error(error)
         return
     _json_echo(
         {
-            "dry_run": True,
+            "dry_run": dry_run,
+            "backup": str(backup_path) if backup_path is not None else None,
             "articles": counts.articles,
             "failed_extractions": counts.failed_extractions,
             "export_runs": counts.export_runs,
             "batch_runs": counts.batch_runs,
         }
     )
+
+
+@app.command()
+def maintenance(
+    action: str = typer.Argument(...),
+    config_path: Path = typer.Option(Path("rss-zen.toml"), "--config", "-c"),
+) -> None:
+    """Run explicit local SQLite maintenance; never invoked by the service automatically."""
+    if action not in {"checkpoint", "vacuum"}:
+        _handle_app_error(
+            AppError("invalid_maintenance_action", "action must be checkpoint or vacuum")
+        )
+        return
+    try:
+        database, _config = _database_from_config(config_path)
+        if action == "checkpoint":
+            busy, log_frames, checkpointed_frames = database.checkpoint_wal()
+            _json_echo(
+                {
+                    "action": action,
+                    "busy": busy,
+                    "log_frames": log_frames,
+                    "checkpointed_frames": checkpointed_frames,
+                }
+            )
+            return
+        usage = shutil.disk_usage(database.path.parent)
+        required_bytes = database.path.stat().st_size
+        if usage.free < required_bytes:
+            raise AppError(
+                "maintenance_insufficient_disk",
+                "vacuum requires free disk space at least equal to the database size",
+            )
+        with database._connection() as connection:
+            connection.execute("VACUUM")
+    except AppError as error:
+        _handle_app_error(error)
+        return
+    typer.echo(f"action={action} database={database.path}")
 
 
 @app.command("list")

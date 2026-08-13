@@ -1131,6 +1131,44 @@ class Database:
             )
         return RetentionCounts(articles, failed_extractions, export_runs, batch_runs)
 
+    def checkpoint_wal(self) -> tuple[int, int, int]:
+        """Run an explicit truncating WAL checkpoint and return SQLite's counters."""
+        with self._connection() as connection:
+            row = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if row is None:
+            raise RuntimeError("wal checkpoint returned no result")
+        return tuple(int(value) for value in row)
+
+    def apply_retention(
+        self,
+        *,
+        articles_before: str | None = None,
+        failed_extractions_before: str | None = None,
+        export_runs_before: str | None = None,
+        batch_runs_before: str | None = None,
+    ) -> RetentionCounts:
+        """Delete configured retention candidates in one database transaction."""
+        with self._connection() as connection:
+            articles = _delete_before(connection, "articles", "last_seen_at", articles_before)
+            failed_extractions = _delete_before(
+                connection,
+                "extractions",
+                "created_at",
+                failed_extractions_before,
+                "status IN ('failed', 'translation_failed')",
+            )
+            export_runs = _delete_before(
+                connection, "export_runs", "created_at", export_runs_before
+            )
+            batch_runs = _delete_before(
+                connection,
+                "batch_runs",
+                "completed_at",
+                batch_runs_before,
+                "status IN ('succeeded', 'failed')",
+            )
+        return RetentionCounts(articles, failed_extractions, export_runs, batch_runs)
+
     def batch_health_counts(self) -> BatchHealthCounts:
         """Return local checkpoint counts without selecting article content."""
         with self._connection() as connection:
@@ -1412,6 +1450,22 @@ def _execute_sql_script(connection: sqlite3.Connection, script: str) -> None:
             statement = ""
     if statement.strip():
         raise ValueError("migration SQL ended with an incomplete statement")
+
+
+def _delete_before(
+    connection: sqlite3.Connection,
+    table: str,
+    timestamp_column: str,
+    cutoff: str | None,
+    extra_where: str = "",
+) -> int:
+    """Delete trusted fixed-schema retention candidates with bound cutoff values."""
+    if cutoff is None:
+        return 0
+    where = f"{timestamp_column} < ?"
+    if extra_where:
+        where += f" AND {extra_where}"
+    return connection.execute(f"DELETE FROM {table} WHERE {where}", (cutoff,)).rowcount
 
 
 def _count_before(
