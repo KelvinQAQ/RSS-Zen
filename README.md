@@ -68,6 +68,8 @@ uv run rss-zen sync --source "Example feed" --config rss-zen.toml
 uv run rss-zen translate --article-id 42 --config rss-zen.toml
 uv run rss-zen translate --status failed --limit 20 --dry-run --config rss-zen.toml
 uv run rss-zen translate --status failed --report-json reports/translate.json --config rss-zen.toml
+# Per-run overrides may only lower the approved [limits] budget.
+uv run rss-zen translate --status failed --max-requests 20 --max-source-chars 100000 --config rss-zen.toml
 
 # Explicit full-text retrieval; no extraction happens during normal sync.
 # Extraction batches are also bounded by [limits].

@@ -99,6 +99,31 @@ def _write_batch_report(path: Path | None, report: dict[str, object]) -> None:
     write_json_report(path, report)
 
 
+def _run_budget(
+    config: AppConfig,
+    *,
+    max_requests: int | None,
+    max_source_chars: int | None,
+) -> RunBudget:
+    """Build a batch budget; CLI overrides may tighten but never expand policy."""
+    configured_requests = config.limits.max_provider_requests_per_run
+    configured_chars = config.limits.max_source_chars_per_run
+    if max_requests is not None and max_requests > configured_requests:
+        raise AppError(
+            "invalid_budget_override",
+            "budget override cannot exceed configured max_provider_requests_per_run",
+        )
+    if max_source_chars is not None and max_source_chars > configured_chars:
+        raise AppError(
+            "invalid_budget_override",
+            "budget override cannot exceed configured max_source_chars_per_run",
+        )
+    return RunBudget(
+        max_requests=max_requests or configured_requests,
+        max_source_chars=max_source_chars or configured_chars,
+    )
+
+
 def _execution_report(
     command: str,
     *,
@@ -130,7 +155,9 @@ def _execution_report(
     }
 
 
-def _dry_run_report(command: str, articles: list[object], config: AppConfig) -> dict[str, object]:
+def _dry_run_report(
+    command: str, articles: list[object], config: AppConfig, budget: RunBudget
+) -> dict[str, object]:
     """Produce a network-free lower-bound estimate for selected source records."""
     source_chars = sum(
         len(value)
@@ -162,8 +189,8 @@ def _dry_run_report(command: str, articles: list[object], config: AppConfig) -> 
                 if command == "translate"
                 else config.limits.max_extract_articles_per_run
             ),
-            "source_chars": config.limits.max_source_chars_per_run,
-            "provider_requests": config.limits.max_provider_requests_per_run,
+            "source_chars": budget.max_source_chars,
+            "provider_requests": budget.max_requests,
         },
         "skipped": [],
     }
@@ -303,6 +330,8 @@ def translate(
     report_json: Path | None = typer.Option(
         None, "--report-json", help="Write a JSON report; use - for stdout."
     ),
+    max_requests: int | None = typer.Option(None, "--max-requests", min=1),
+    max_source_chars: int | None = typer.Option(None, "--max-source-chars", min=1),
     config_path: Path = typer.Option(Path("rss-zen.toml"), "--config", "-c"),
 ) -> None:
     """Retry translation for explicitly selected source articles."""
@@ -336,16 +365,17 @@ def translate(
             )[:effective_limit]
         if not articles:
             raise AppError("article_not_found", "no article matches the requested selector")
+        budget = _run_budget(
+            config, max_requests=max_requests, max_source_chars=max_source_chars
+        )
         if dry_run:
             for article in articles:
                 typer.echo(f"article_id={article.id} title={article.title}")
-            _write_batch_report(report_json, _dry_run_report("translate", articles, config))
+            _write_batch_report(
+                report_json, _dry_run_report("translate", articles, config, budget)
+            )
             typer.echo(f"selected={len(articles)} dry_run=true")
             return
-        budget = RunBudget(
-            max_requests=config.limits.max_provider_requests_per_run,
-            max_source_chars=config.limits.max_source_chars_per_run,
-        )
         with httpx.Client(timeout=30.0) as client:
             service = build_translation_service(
                 database,
@@ -436,6 +466,8 @@ def extract(
     report_json: Path | None = typer.Option(
         None, "--report-json", help="Write a JSON report; use - for stdout."
     ),
+    max_requests: int | None = typer.Option(None, "--max-requests", min=1),
+    max_source_chars: int | None = typer.Option(None, "--max-source-chars", min=1),
     config_path: Path = typer.Option(Path("rss-zen.toml"), "--config", "-c"),
 ) -> None:
     """Retrieve full text for selected articles."""
@@ -462,16 +494,17 @@ def extract(
         )[: limit or config.limits.max_extract_articles_per_run]
         if not articles:
             raise AppError("article_not_found", "no article matches the requested selector")
+        budget = _run_budget(
+            config, max_requests=max_requests, max_source_chars=max_source_chars
+        )
         if dry_run:
             for article in articles:
                 typer.echo(f"article_id={article.id} title={article.title}")
-            _write_batch_report(report_json, _dry_run_report("extract", articles, config))
+            _write_batch_report(
+                report_json, _dry_run_report("extract", articles, config, budget)
+            )
             typer.echo(f"selected={len(articles)} dry_run=true")
             return
-        budget = RunBudget(
-            max_requests=config.limits.max_provider_requests_per_run,
-            max_source_chars=config.limits.max_source_chars_per_run,
-        )
         with httpx.Client(timeout=30.0) as client:
             translator = build_translation_service(
                 database,

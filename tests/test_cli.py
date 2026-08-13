@@ -299,6 +299,65 @@ target_language = "zh-CN"
     assert "provider" in result.stdout
 
 
+def test_translate_rejects_budget_override_above_configured_limit(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("FREE_TRANSLATION_API_KEY", "free-secret")
+    config_path = tmp_path / "rss-zen.toml"
+    config_path.write_text(
+        """
+[database]
+path = "rss-zen.sqlite3"
+
+[limits]
+max_provider_requests_per_run = 2
+max_source_chars_per_run = 20
+
+[translation]
+target_language = "zh-CN"
+
+[[translation.providers]]
+name = "free"
+kind = "libretranslate"
+endpoint = "https://translate.example.test/translate"
+api_key_env = "FREE_TRANSLATION_API_KEY"
+""",
+        encoding="utf-8",
+    )
+    from rss_zen.db import ArticleInput, Database, FeedInput
+
+    database = Database(tmp_path / "rss-zen.sqlite3")
+    database.initialize()
+    feed = database.upsert_feed(FeedInput(name="Example", url="https://example.test/feed.xml"))
+    article = database.reconcile_article(
+        feed.id,
+        ArticleInput(
+            guid="a1",
+            canonical_url="https://example.test/one",
+            title="One",
+            summary=None,
+            content=None,
+            author=None,
+            categories=(),
+            published_at=None,
+        ),
+    ).article
+
+    result = runner.invoke(
+        app,
+        [
+            "translate",
+            "--article-id",
+            str(article.id),
+            "--max-requests",
+            "3",
+            "--config",
+            str(config_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "budget override" in result.stderr
+
+
 def test_translate_writes_report_before_budget_exhaustion(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("FREE_TRANSLATION_API_KEY", "free-secret")
     config_path = tmp_path / "rss-zen.toml"
