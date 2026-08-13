@@ -914,6 +914,13 @@ def doctor(
                         "ok",
                         f"{database_path.name} ({size_mb:.1f} MB), integrity ok",
                     )
+                    backup_directory = _resolve_config_path(config.backup.directory, config_path)
+                    _health_filesystem_snapshot(database_path, backup_directory)
+                    _check(
+                        "database_storage",
+                        "ok",
+                        "database/WAL/SHM and filesystem capacity are readable",
+                    )
                 else:
                     _check("database", "error", f"integrity check failed: {integrity}")
             except sqlite3.Error as error:
@@ -942,6 +949,16 @@ def doctor(
                 f"latest feed success: {latest_success or 'never'}",
             )
             counts = database.processing_counts(config.translation.target_language)
+            batch_counts = database.batch_health_counts()
+            batch_status = (
+                "warning" if batch_counts.interrupted or batch_counts.resumable_items else "ok"
+            )
+            _check(
+                "batches",
+                batch_status,
+                f"{batch_counts.running} running, {batch_counts.interrupted} interrupted, "
+                f"{batch_counts.resumable_items} resumable items",
+            )
             problems = counts.failed_translation_count + counts.failed_extraction_count
             _check(
                 "processing",
@@ -973,9 +990,15 @@ def doctor(
         )
 
     if json_output:
+        warning_count = sum(check["status"] == "warning" for check in checks)
+        error_count = sum(check["status"] == "error" for check in checks)
         _json_echo(
             {
-                "healthy": all(check["status"] != "error" for check in checks),
+                "schema_version": 1,
+                "generated_at": datetime.now(UTC).isoformat(),
+                "healthy": error_count == 0,
+                "warning_count": warning_count,
+                "error_count": error_count,
                 "checks": checks,
             }
         )

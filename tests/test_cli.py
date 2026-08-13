@@ -327,6 +327,77 @@ api_key_env = "FREE_TRANSLATION_API_KEY"
     assert "no backups found" not in result.stdout
 
 
+def test_doctor_json_exposes_health_contract_v1(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("FREE_TRANSLATION_API_KEY", "free-secret")
+    config_path = tmp_path / "rss-zen.toml"
+    config_path.write_text(
+        """
+[database]
+path = "rss-zen.sqlite3"
+
+[backup]
+directory = "backups"
+
+[translation]
+target_language = "zh-CN"
+
+[[translation.providers]]
+name = "free"
+kind = "libretranslate"
+endpoint = "https://translate.example.test/translate"
+api_key_env = "FREE_TRANSLATION_API_KEY"
+""",
+        encoding="utf-8",
+    )
+    from rss_zen.db import Database
+
+    database = Database(tmp_path / "rss-zen.sqlite3")
+    database.initialize()
+
+    result = runner.invoke(app, ["doctor", "--json", "--config", str(config_path)])
+
+    assert result.exit_code == 0
+    import json as _json
+
+    payload = _json.loads(result.stdout)
+    assert payload["schema_version"] == 1
+    assert payload["generated_at"]
+    assert payload["warning_count"] >= 1  # no backup is a warning
+    assert payload["error_count"] == 0
+    assert payload["healthy"] is True
+    checks = {check["check"]: check for check in payload["checks"]}
+    assert checks["database"]["status"] == "ok"
+    assert "database_storage" in checks
+    assert "batches" in checks
+
+
+def test_doctor_never_creates_missing_database(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("FREE_TRANSLATION_API_KEY", "free-secret")
+    config_path = tmp_path / "rss-zen.toml"
+    config_path.write_text(
+        """
+[database]
+path = "missing.sqlite3"
+
+[translation]
+target_language = "zh-CN"
+
+[[translation.providers]]
+name = "free"
+kind = "libretranslate"
+endpoint = "https://translate.example.test/translate"
+api_key_env = "FREE_TRANSLATION_API_KEY"
+""",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["doctor", "--json", "--config", str(config_path)])
+
+    assert result.exit_code == 0
+    assert not (tmp_path / "missing.sqlite3").exists()
+    assert not (tmp_path / "missing.sqlite3-wal").exists()
+
+
 def test_doctor_reports_configuration_error(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("FREE_TRANSLATION_API_KEY", "free-secret")
     config_path = tmp_path / "rss-zen.toml"
