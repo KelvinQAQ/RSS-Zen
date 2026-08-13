@@ -243,6 +243,16 @@ class BatchHealthCounts:
     resumable_items: int
 
 
+@dataclass(frozen=True)
+class RetentionCounts:
+    """Candidate row counts from a non-destructive retention preview."""
+
+    articles: int = 0
+    failed_extractions: int = 0
+    export_runs: int = 0
+    batch_runs: int = 0
+
+
 _MIGRATION_1 = """
 CREATE TABLE IF NOT EXISTS feeds (
     id INTEGER PRIMARY KEY,
@@ -1093,6 +1103,34 @@ class Database:
             failed_extraction_count=failed_extraction_count,
         )
 
+    def retention_counts(
+        self,
+        *,
+        articles_before: str | None = None,
+        failed_extractions_before: str | None = None,
+        export_runs_before: str | None = None,
+        batch_runs_before: str | None = None,
+    ) -> RetentionCounts:
+        """Preview independently configured retention candidates without mutation."""
+        with self._connection() as connection:
+            articles = _count_before(connection, "articles", "last_seen_at", articles_before)
+            failed_extractions = _count_before(
+                connection,
+                "extractions",
+                "created_at",
+                failed_extractions_before,
+                "status IN ('failed', 'translation_failed')",
+            )
+            export_runs = _count_before(connection, "export_runs", "created_at", export_runs_before)
+            batch_runs = _count_before(
+                connection,
+                "batch_runs",
+                "completed_at",
+                batch_runs_before,
+                "status IN ('succeeded', 'failed')",
+            )
+        return RetentionCounts(articles, failed_extractions, export_runs, batch_runs)
+
     def batch_health_counts(self) -> BatchHealthCounts:
         """Return local checkpoint counts without selecting article content."""
         with self._connection() as connection:
@@ -1374,6 +1412,25 @@ def _execute_sql_script(connection: sqlite3.Connection, script: str) -> None:
             statement = ""
     if statement.strip():
         raise ValueError("migration SQL ended with an incomplete statement")
+
+
+def _count_before(
+    connection: sqlite3.Connection,
+    table: str,
+    timestamp_column: str,
+    cutoff: str | None,
+    extra_where: str = "",
+) -> int:
+    """Count trusted fixed-schema retention candidates using bound cutoff values."""
+    if cutoff is None:
+        return 0
+    where = f"{timestamp_column} < ?"
+    if extra_where:
+        where += f" AND {extra_where}"
+    row = connection.execute(
+        f"SELECT COUNT(*) FROM {table} WHERE {where}", (cutoff,)
+    ).fetchone()
+    return int(row[0])
 
 
 def _batch_run_from_row(row: sqlite3.Row) -> BatchRunRecord:

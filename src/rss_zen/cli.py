@@ -687,6 +687,57 @@ def extract(
         raise typer.Exit(code=1)
 
 
+@app.command()
+def retention(
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    config_path: Path = typer.Option(Path("rss-zen.toml"), "--config", "-c"),
+) -> None:
+    """Preview configured data-retention candidates; deletion is not implemented yet."""
+    if not dry_run:
+        _handle_app_error(
+            AppError(
+                "retention_apply_required",
+                "use 'rss-zen retention --dry-run' to preview candidates",
+            )
+        )
+        return
+    try:
+        database, config = _database_from_config(config_path)
+        settings = config.retention
+        if not any(
+            (
+                settings.articles_days,
+                settings.failed_extractions_days,
+                settings.export_runs_days,
+                settings.batch_runs_days,
+            )
+        ):
+            raise AppError("retention_not_configured", "no retention periods are configured")
+        now = datetime.now(UTC)
+
+        def cutoff(days: int | None) -> str | None:
+            return (now - timedelta(days=days)).isoformat() if days else None
+
+        counts = database.retention_counts(
+            articles_before=cutoff(settings.articles_days),
+            failed_extractions_before=cutoff(settings.failed_extractions_days),
+            export_runs_before=cutoff(settings.export_runs_days),
+            batch_runs_before=cutoff(settings.batch_runs_days),
+        )
+    except AppError as error:
+        _handle_app_error(error)
+        return
+    _json_echo(
+        {
+            "dry_run": True,
+            "articles": counts.articles,
+            "failed_extractions": counts.failed_extractions,
+            "export_runs": counts.export_runs,
+            "batch_runs": counts.batch_runs,
+        }
+    )
+
+
 @app.command("list")
 def list_articles(
     source: str | None = typer.Option(None, "--source", "-s", help="Filter by feed name or URL."),

@@ -213,6 +213,34 @@ url = "https://malformed.example.test/rss"
     assert payload["feed_health"]["stale"] == 2
 
 
+def test_retention_dry_run_requires_explicit_configuration(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("FREE_TRANSLATION_API_KEY", "free-secret")
+    config_path = tmp_path / "rss-zen.toml"
+    config_path.write_text(
+        """
+[database]
+path = "rss-zen.sqlite3"
+
+[translation]
+target_language = "zh-CN"
+
+[[translation.providers]]
+name = "free"
+kind = "libretranslate"
+endpoint = "https://translate.example.test/translate"
+api_key_env = "FREE_TRANSLATION_API_KEY"
+""",
+        encoding="utf-8",
+    )
+    from rss_zen.db import Database
+
+    Database(tmp_path / "rss-zen.sqlite3").initialize()
+    result = runner.invoke(app, ["retention", "--dry-run", "--config", str(config_path)])
+
+    assert result.exit_code == 1
+    assert "retention_not_configured" in result.stderr
+
+
 def test_list_command_runs(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("FREE_TRANSLATION_API_KEY", "free-secret")
     config_path = tmp_path / "rss-zen.toml"

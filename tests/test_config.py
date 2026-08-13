@@ -126,6 +126,7 @@ def test_loads_equivalent_toml_and_yaml_config(tmp_path: Path, filename: str, co
     assert config.backup.directory == Path("backups")
     assert config.backup.retention_days == 30
     assert config.backup.retention_count == 30
+    assert config.retention.articles_days is None
     assert config.service.translation_max_attempts == 5
     assert config.translation.providers[0].api_key == "free-secret"
     ai_provider = config.translation.providers[1]
@@ -250,6 +251,16 @@ def test_rejects_invalid_provider_run_budget(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ConfigurationError, match="max_provider_requests_per_run"):
+        load_config(config_path)
+
+
+def test_rejects_invalid_data_retention(tmp_path: Path) -> None:
+    config_path = tmp_path / "rss-zen.toml"
+    config_path.write_text(
+        _toml_config() + "\n[retention]\narticles_days = 0\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ConfigurationError, match="articles_days"):
         load_config(config_path)
 
 

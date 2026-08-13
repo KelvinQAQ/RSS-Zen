@@ -61,6 +61,17 @@ class BackupSettings(BaseModel):
     retention_count: int = Field(default=30, ge=1)
 
 
+class RetentionSettings(BaseModel):
+    """Optional UTC-day retention policy; omitted fields remain disabled."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    articles_days: int | None = Field(default=None, ge=1)
+    failed_extractions_days: int | None = Field(default=None, ge=1)
+    export_runs_days: int | None = Field(default=None, ge=1)
+    batch_runs_days: int | None = Field(default=None, ge=1)
+
+
 class TranslationProviderConfig(BaseModel):
     """One translation backend in priority order."""
 
@@ -423,6 +434,7 @@ class AppConfig(BaseModel):
     service: ServiceSettings = Field(default_factory=ServiceSettings)
     limits: LimitsSettings = Field(default_factory=LimitsSettings)
     backup: BackupSettings = Field(default_factory=BackupSettings)
+    retention: RetentionSettings = Field(default_factory=RetentionSettings)
     translation: TranslationSettings
     anysearch: AnySearchSettings = Field(default_factory=AnySearchSettings)
     feeds: list[FeedConfig] = Field(default_factory=list)

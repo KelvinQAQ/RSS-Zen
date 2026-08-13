@@ -141,6 +141,22 @@ def test_schema_4_backup_restore_preserves_resumable_checkpoint(tmp_path: Path) 
     assert restored.batch_run_resumable_article_ids(run.id) == (second.id,)
 
 
+def test_retention_preview_counts_only_configured_candidates(database: Database) -> None:
+    feed = database.upsert_feed(_feed())
+    article = database.reconcile_article(feed.id, _article()).article
+    with database._connection() as connection:
+        connection.execute(
+            "UPDATE articles SET last_seen_at = ? WHERE id = ?",
+            ("2000-01-01T00:00:00+00:00", article.id),
+        )
+
+    counts = database.retention_counts(articles_before="2001-01-01T00:00:00+00:00")
+
+    assert counts.articles == 1
+    assert counts.failed_extractions == 0
+    assert database.retention_counts().articles == 0
+
+
 def test_batch_run_materializes_ordered_article_selection(database: Database) -> None:
     feed = database.upsert_feed(_feed())
     first = database.reconcile_article(feed.id, _article()).article
