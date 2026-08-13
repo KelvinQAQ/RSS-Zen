@@ -42,7 +42,8 @@ safe without introducing a job queue.
 **Out of scope:** automatic extraction, distributed workers, Redis/Celery, multi-host service
 operation, or replacing SQLite.
 
-See the [v0.2.0 scope and exit criteria](releases/v0.2.0.md).
+See the [v0.2.0 scope and exit criteria](releases/v0.2.0.md) and the post-release
+[operational observation protocol](operations/v0.2-observation-protocol.md).
 
 ## v0.3.0 — Durable processing jobs
 
