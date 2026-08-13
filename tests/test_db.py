@@ -105,6 +105,42 @@ def test_migration_snapshot_includes_uncheckpointed_wal_data(tmp_path: Path) -> 
     assert Database(database_path).schema_version() == 4
 
 
+def test_schema_4_backup_restore_preserves_resumable_checkpoint(tmp_path: Path) -> None:
+    """A verified post-migration backup must retain checkpoint resume state."""
+    from rss_zen.backup import backup_database
+
+    database_path = tmp_path / "rss-zen.sqlite3"
+    database = Database(database_path)
+    database.initialize()
+    feed = database.upsert_feed(_feed())
+    first = database.reconcile_article(feed.id, _article()).article
+    second = database.reconcile_article(
+        feed.id,
+        _article(guid="article-2", canonical_url="https://example.test/articles/two"),
+    ).article
+    run = database.create_batch_run(
+        command="translate",
+        article_ids=(first.id, second.id),
+        selector={"article_ids": [first.id, second.id]},
+        limits={"provider_requests": 2},
+    )
+    database.complete_batch_run_item(run.id, first.id, status="succeeded")
+    database.complete_batch_run_item(
+        run.id, second.id, status="skipped", error_code="provider_budget_exhausted"
+    )
+    database.update_batch_run_status(run.id, status="interrupted")
+
+    backup = backup_database(database_path, tmp_path / "backups")
+    restored_path = tmp_path / "restored.sqlite3"
+    restored_path.write_bytes(backup.read_bytes())
+    restored = Database(restored_path)
+    restored.initialize()
+
+    assert restored.schema_version() == 4
+    assert restored.get_batch_run(run.id).status == "interrupted"
+    assert restored.batch_run_resumable_article_ids(run.id) == (second.id,)
+
+
 def test_batch_run_materializes_ordered_article_selection(database: Database) -> None:
     feed = database.upsert_feed(_feed())
     first = database.reconcile_article(feed.id, _article()).article

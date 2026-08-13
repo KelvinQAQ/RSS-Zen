@@ -764,6 +764,63 @@ api_key_env = "FREE_TRANSLATION_API_KEY"
     assert database.get_batch_run(run.id).status == "succeeded"
 
 
+def test_translate_resume_limit_keeps_remaining_items_interrupted(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("FREE_TRANSLATION_API_KEY", "free-secret")
+    config_path = tmp_path / "rss-zen.toml"
+    config_path.write_text(
+        """
+[database]
+path = "rss-zen.sqlite3"
+
+[translation]
+target_language = "zh-CN"
+
+[[translation.providers]]
+name = "free"
+kind = "libretranslate"
+endpoint = "https://translate.example.test/translate"
+api_key_env = "FREE_TRANSLATION_API_KEY"
+""",
+        encoding="utf-8",
+    )
+    from rss_zen.db import ArticleInput, Database, FeedInput
+
+    database = Database(tmp_path / "rss-zen.sqlite3")
+    database.initialize()
+    feed = database.upsert_feed(FeedInput(name="Example", url="https://example.test/feed.xml"))
+    articles = [
+        database.reconcile_article(
+            feed.id,
+            ArticleInput(
+                guid=f"a{index}", canonical_url=f"https://example.test/{index}", title=str(index),
+                summary=None, content=None, author=None, categories=(), published_at=None,
+            ),
+        ).article
+        for index in range(2)
+    ]
+    run = database.create_batch_run(
+        command="translate",
+        article_ids=tuple(article.id for article in articles),
+        selector={},
+        limits={},
+    )
+    database.update_batch_run_status(run.id, status="interrupted")
+
+    class FakeService:
+        def translate_article(self, record, *, force=False):
+            from rss_zen.translation import TranslationOutcome
+            return TranslationOutcome(record.id, "succeeded", "free")
+
+    monkeypatch.setattr("rss_zen.cli.build_translation_service", lambda *a, **k: FakeService())
+    result = runner.invoke(
+        app, ["translate", "--resume", str(run.id), "--limit", "1", "--config", str(config_path)]
+    )
+
+    assert result.exit_code == 0
+    assert database.get_batch_run(run.id).status == "interrupted"
+    assert len(database.batch_run_resumable_article_ids(run.id)) == 1
+
+
 def test_translate_retries_failed_articles_by_status(tmp_path, monkeypatch) -> None:
     """--status failed selects failed articles and re-translates them."""
     monkeypatch.setenv("FREE_TRANSLATION_API_KEY", "free-secret")

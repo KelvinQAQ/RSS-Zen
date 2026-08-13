@@ -475,8 +475,10 @@ def translate(
         },
     )
     if batch_run is not None and budget_error is None:
+        remaining = database.batch_run_resumable_article_ids(batch_run.id)
         database.update_batch_run_status(
-            batch_run.id, status="succeeded" if failures == 0 else "failed"
+            batch_run.id,
+            status="interrupted" if remaining else ("succeeded" if failures == 0 else "failed"),
         )
     if budget_error is not None:
         _handle_app_error(budget_error)
@@ -667,8 +669,10 @@ def extract(
         },
     )
     if batch_run is not None and budget_error is None:
+        remaining = database.batch_run_resumable_article_ids(batch_run.id)
         database.update_batch_run_status(
-            batch_run.id, status="succeeded" if failures == 0 else "failed"
+            batch_run.id,
+            status="interrupted" if remaining else ("succeeded" if failures == 0 else "failed"),
         )
     if budget_error is not None:
         _handle_app_error(budget_error)
