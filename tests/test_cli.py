@@ -102,6 +102,55 @@ api_key_env = "FREE_TRANSLATION_API_KEY"
     assert payload["errors"] == []
 
 
+def test_status_json_exposes_health_contract_v1(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("FREE_TRANSLATION_API_KEY", "free-secret")
+    config_path = tmp_path / "rss-zen.toml"
+    config_path.write_text(
+        """
+[database]
+path = "rss-zen.sqlite3"
+
+[backup]
+directory = "backups"
+
+[translation]
+target_language = "zh-CN"
+
+[[translation.providers]]
+name = "free"
+kind = "libretranslate"
+endpoint = "https://translate.example.test/translate"
+api_key_env = "FREE_TRANSLATION_API_KEY"
+""",
+        encoding="utf-8",
+    )
+    from rss_zen.db import Database
+
+    database = Database(tmp_path / "rss-zen.sqlite3")
+    database.initialize()
+
+    result = runner.invoke(app, ["status", "--json", "--config", str(config_path)])
+
+    assert result.exit_code == 0
+    import json as _json
+
+    payload = _json.loads(result.stdout)
+    assert payload["schema_version"] == 1
+    assert payload["generated_at"]
+    assert payload["database"]["schema_version"] == 4
+    assert payload["database"]["size_bytes"] > 0
+    assert payload["database"]["wal_size_bytes"] >= 0
+    assert payload["disk"]["free_bytes"] > 0
+    assert payload["feed_health"] == {
+        "total": 0,
+        "enabled": 0,
+        "never_succeeded": 0,
+        "stale": 0,
+    }
+    assert payload["batches"] == {"running": 0, "interrupted": 0, "resumable_items": 0}
+    assert payload["backups"]["newest"] is None
+
+
 def test_list_command_runs(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("FREE_TRANSLATION_API_KEY", "free-secret")
     config_path = tmp_path / "rss-zen.toml"

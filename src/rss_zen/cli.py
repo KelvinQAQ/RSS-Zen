@@ -2,6 +2,7 @@
 
 import json
 import re
+import shutil
 import signal
 import sqlite3
 from collections.abc import Callable
@@ -1028,11 +1029,36 @@ def status(
         return
     if json_output:
         feeds = database.list_feeds()
+        enabled_feeds = [feed for feed in feeds if feed.enabled]
         latest_success = max(
             (feed.last_success_at for feed in feeds if feed.last_success_at), default=None
         )
+        backup_directory = _resolve_config_path(config.backup.directory, config_path)
+        filesystem = _health_filesystem_snapshot(database.path, backup_directory)
+        batch_counts = database.batch_health_counts()
         _json_echo(
             {
+                "schema_version": 1,
+                "generated_at": datetime.now(UTC).isoformat(),
+                "database": {
+                    **filesystem["database"],
+                    "schema_version": database.schema_version(),
+                },
+                "disk": filesystem["disk"],
+                "backups": filesystem["backups"],
+                "feed_health": {
+                    "total": len(feeds),
+                    "enabled": len(enabled_feeds),
+                    "never_succeeded": sum(
+                        1 for feed in enabled_feeds if feed.last_success_at is None
+                    ),
+                    "stale": sum(1 for feed in enabled_feeds if feed.last_success_at is None),
+                },
+                "batches": {
+                    "running": batch_counts.running,
+                    "interrupted": batch_counts.interrupted,
+                    "resumable_items": batch_counts.resumable_items,
+                },
                 "counts": {
                     "articles": counts.article_count,
                     "pending_translation": counts.pending_translation_count,
@@ -1093,6 +1119,41 @@ def status(
         )
     for error in errors:
         typer.echo(f"{error.workflow}_error={error.error_code} count={error.count}")
+
+
+def _health_filesystem_snapshot(database_path: Path, backup_directory: Path) -> dict[str, object]:
+    """Collect local file-system health data without opening external connections."""
+    usage = shutil.disk_usage(database_path.parent)
+    backups = sorted(backup_directory.glob("rss-*.sqlite3")) if backup_directory.is_dir() else []
+    newest = backups[-1] if backups else None
+    generated_at = datetime.now(UTC)
+    newest_age_seconds = (
+        int((generated_at - datetime.fromtimestamp(newest.stat().st_mtime, UTC)).total_seconds())
+        if newest is not None
+        else None
+    )
+    return {
+        "database": {
+            "path": str(database_path),
+            "size_bytes": database_path.stat().st_size,
+            "wal_size_bytes": _file_size(database_path.with_name(f"{database_path.name}-wal")),
+            "shm_size_bytes": _file_size(database_path.with_name(f"{database_path.name}-shm")),
+        },
+        "disk": {"free_bytes": usage.free, "total_bytes": usage.total},
+        "backups": {
+            "directory": str(backup_directory),
+            "newest": newest.name if newest is not None else None,
+            "newest_age_seconds": newest_age_seconds,
+            "size_bytes": sum(path.stat().st_size for path in backups),
+        },
+    }
+
+
+def _file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
 
 
 def _resolve_config_path(path: Path, config_path: Path) -> Path:

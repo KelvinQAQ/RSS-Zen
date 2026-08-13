@@ -234,6 +234,15 @@ class ProcessingErrorCount:
     count: int
 
 
+@dataclass(frozen=True)
+class BatchHealthCounts:
+    """Aggregate local manual-batch state for health reporting."""
+
+    running: int
+    interrupted: int
+    resumable_items: int
+
+
 _MIGRATION_1 = """
 CREATE TABLE IF NOT EXISTS feeds (
     id INTEGER PRIMARY KEY,
@@ -1083,6 +1092,30 @@ class Database:
             terminal_translation_count=terminal_translation_count,
             failed_extraction_count=failed_extraction_count,
         )
+
+    def batch_health_counts(self) -> BatchHealthCounts:
+        """Return local checkpoint counts without selecting article content."""
+        with self._connection() as connection:
+            running = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM batch_runs WHERE status = 'running'"
+                ).fetchone()[0]
+            )
+            interrupted = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM batch_runs WHERE status = 'interrupted'"
+                ).fetchone()[0]
+            )
+            resumable_items = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM batch_run_items
+                    WHERE status IN ('pending', 'failed')
+                       OR (status = 'skipped' AND error_code = 'provider_budget_exhausted')
+                    """
+                ).fetchone()[0]
+            )
+        return BatchHealthCounts(running, interrupted, resumable_items)
 
     def processing_error_counts(self, target_language: str) -> list[ProcessingErrorCount]:
         """Aggregate stored failures without exposing provider response bodies."""
