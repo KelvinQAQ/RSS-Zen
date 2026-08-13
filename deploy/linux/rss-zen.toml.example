@@ -25,6 +25,14 @@ directory = "/var/lib/rss-zen/backups"
 retention_days = 30
 retention_count = 30
 
+# Data deletion is disabled by default. Uncomment and choose periods only after
+# running `rss-zen retention --dry-run` against production data.
+# [retention]
+# articles_days = 365
+# failed_extractions_days = 30
+# export_runs_days = 90
+# batch_runs_days = 30
+
 [translation]
 target_language = "zh-CN"
 
