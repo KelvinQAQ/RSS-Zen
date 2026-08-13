@@ -3,7 +3,8 @@
 RSS-Zen is a local, cross-platform command-line workflow for multilingual RSS and
 Atom feeds. It stores source data in SQLite, translates articles to Simplified
 Chinese, optionally retrieves full text through AnySearch, and renders reusable
-Markdown article collections.
+Markdown article collections. Development scope, release exit criteria, and architecture decisions
+are maintained in the [roadmap](docs/roadmap.md).
 
 ## Setup
 
