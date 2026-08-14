@@ -625,6 +625,30 @@ CREATE TABLE edition_editorial_results (
 );
 """
 
+_MIGRATION_9 = """
+CREATE TABLE feed_probe_tokens (
+    token TEXT PRIMARY KEY,
+    normalized_url TEXT NOT NULL,
+    url_hash TEXT NOT NULL,
+    feed_title TEXT,
+    entry_count INTEGER NOT NULL CHECK(entry_count >= 0),
+    expires_at TEXT NOT NULL,
+    consumed_at TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE mutation_audit (
+    id INTEGER PRIMARY KEY,
+    actor TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    target_type TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    metadata_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX idx_mutation_audit_created ON mutation_audit(created_at, id);
+"""
+
 _MIGRATIONS: tuple[tuple[int, str], ...] = (
     (1, _MIGRATION_1),
     (2, _MIGRATION_2),
@@ -634,6 +658,7 @@ _MIGRATIONS: tuple[tuple[int, str], ...] = (
     (6, _MIGRATION_6),
     (7, _MIGRATION_7),
     (8, _MIGRATION_8),
+    (9, _MIGRATION_9),
 )
 _PRE_MIGRATION_BACKUP_RETENTION_COUNT = 10
 
@@ -1405,6 +1430,77 @@ class Database:
         if row is None:
             raise RuntimeError("feed upsert did not return a record")
         return _feed_from_row(row)
+
+    def set_feed_enabled(self, feed_id: int, *, enabled: bool) -> FeedRecord:
+        """Enable or disable a feed without deleting article history."""
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE feeds SET enabled=?, updated_at=? WHERE id=?",
+                (int(enabled), _utc_now(), feed_id),
+            )
+            row = connection.execute("SELECT * FROM feeds WHERE id=?", (feed_id,)).fetchone()
+        if cursor.rowcount != 1 or row is None:
+            raise KeyError(feed_id)
+        return _feed_from_row(row)
+
+    def save_feed_probe(
+        self,
+        *,
+        token: str,
+        normalized_url: str,
+        url_hash: str,
+        feed_title: str | None,
+        entry_count: int,
+        expires_at: str,
+    ) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                """INSERT INTO feed_probe_tokens(
+                token, normalized_url, url_hash, feed_title, entry_count, expires_at, created_at
+                ) VALUES (?,?,?,?,?,?,?)""",
+                (token, normalized_url, url_hash, feed_title, entry_count, expires_at, _utc_now()),
+            )
+
+    def consume_feed_probe(self, token: str, *, url_hash: str, now: str) -> Mapping[str, object]:
+        """Consume one matching, unexpired probe token exactly once."""
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM feed_probe_tokens WHERE token=?", (token,)
+            ).fetchone()
+            if row is None or row["consumed_at"] is not None:
+                raise ValueError("feed probe token is missing or already consumed")
+            if row["url_hash"] != url_hash or str(row["expires_at"]) < now:
+                raise ValueError("feed probe token does not match or has expired")
+            connection.execute(
+                "UPDATE feed_probe_tokens SET consumed_at=? WHERE token=?", (now, token)
+            )
+        return {
+            "normalized_url": str(row["normalized_url"]),
+            "feed_title": row["feed_title"],
+            "entry_count": int(row["entry_count"]),
+        }
+
+    def record_mutation_audit(
+        self,
+        *,
+        actor: str,
+        operation: str,
+        target_type: str,
+        target_id: str,
+        outcome: str,
+        metadata: Mapping[str, object],
+    ) -> int:
+        """Append bounded mutation metadata without content, URL queries, or secrets."""
+        encoded = _json_object(metadata, field="audit_metadata")
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """INSERT INTO mutation_audit(
+                actor, operation, target_type, target_id, outcome, metadata_json, created_at
+                ) VALUES (?,?,?,?,?,?,?)""",
+                (actor, operation, target_type, target_id, outcome, encoded, _utc_now()),
+            )
+        return int(cursor.lastrowid)
 
     def get_feed_by_url(self, url: str) -> FeedRecord | None:
         """Look up a feed by URL."""

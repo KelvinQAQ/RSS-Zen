@@ -17,6 +17,7 @@ import typer
 from rss_zen.backup import backup_database
 from rss_zen.budget import RunBudget
 from rss_zen.config import load_config
+from rss_zen.control import FeedControlService
 from rss_zen.coordinator import DeadlineCoordinator
 from rss_zen.db import Database
 from rss_zen.delivery import DeliveryWorker
@@ -299,6 +300,104 @@ def serve(
         typer.echo("service stopped")
     except AppError as error:
         _handle_app_error(error)
+
+
+@app.command("feed-probe")
+def feed_probe(
+    url: str = typer.Option(..., "--url"),
+    config_path: Path = typer.Option(Path("rss-zen.toml"), "--config", "-c"),
+) -> None:
+    """Probe one public unauthenticated feed and issue a short-lived add token."""
+    try:
+        database, config = _database_from_config(config_path)
+        with httpx.Client(timeout=30.0) as client:
+            result = FeedControlService(
+                database,
+                FeedHttpClient(
+                    client,
+                    max_response_bytes=config.limits.max_feed_response_bytes,
+                    policy=FeedUrlPolicy(),
+                ),
+            ).probe(url)
+        _json_echo({"schema_version": 1, "operation": "feed.probe", **asdict(result)})
+    except AppError as error:
+        _handle_app_error(error)
+
+
+@app.command("feed-add")
+def feed_add(
+    token: str = typer.Option(..., "--probe-token"),
+    url: str = typer.Option(..., "--url"),
+    name: str = typer.Option(..., "--name"),
+    category: list[str] | None = typer.Option(None, "--category"),
+    actor: str = typer.Option("pi-agent", "--actor"),
+    config_path: Path = typer.Option(Path("rss-zen.toml"), "--config", "-c"),
+) -> None:
+    """Add an already-probed public feed and append mutation audit."""
+    try:
+        database, _ = _database_from_config(config_path)
+        feed = FeedControlService(database, FeedHttpClient(httpx.Client())).add(
+            token=token, url=url, name=name, categories=tuple(category or ()), actor=actor
+        )
+        _json_echo(
+            {
+                "schema_version": 1,
+                "operation": "feed.add",
+                "feed_id": feed.id,
+                "enabled": feed.enabled,
+                "origin": feed.origin,
+            }
+        )
+    except AppError as error:
+        _handle_app_error(error)
+
+
+@app.command("feed-list")
+def feed_list(config_path: Path = typer.Option(Path("rss-zen.toml"), "--config", "-c")) -> None:
+    """List typed feed state for Agent inspection."""
+    database, _ = _database_from_config(config_path)
+    _json_echo(
+        {
+            "schema_version": 1,
+            "feeds": [
+                {
+                    "id": feed.id,
+                    "name": feed.name,
+                    "url": feed.url,
+                    "enabled": feed.enabled,
+                    "last_success": feed.last_success_at,
+                    "last_error": feed.last_error_code,
+                }
+                for feed in database.list_feeds()
+            ],
+        }
+    )
+
+
+@app.command("feed-disable")
+def feed_disable(
+    feed_id: int = typer.Option(..., "--feed-id", min=1),
+    actor: str = typer.Option("pi-agent", "--actor"),
+    config_path: Path = typer.Option(Path("rss-zen.toml"), "--config", "-c"),
+) -> None:
+    """Disable a feed without deleting history and append mutation audit."""
+    try:
+        database, _ = _database_from_config(config_path)
+        feed = FeedControlService(database, FeedHttpClient(httpx.Client())).disable(
+            feed_id, actor=actor
+        )
+        _json_echo(
+            {
+                "schema_version": 1,
+                "operation": "feed.disable",
+                "feed_id": feed.id,
+                "enabled": feed.enabled,
+            }
+        )
+    except (AppError, KeyError) as error:
+        if isinstance(error, AppError):
+            _handle_app_error(error)
+        _handle_app_error(AppError("feed_not_found", "feed does not exist", cause=error))
 
 
 @app.command()
