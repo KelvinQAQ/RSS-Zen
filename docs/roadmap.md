@@ -45,19 +45,32 @@ operation, or replacing SQLite.
 See the [v0.2.0 scope and exit criteria](releases/v0.2.0.md) and the post-release
 [operational observation protocol](operations/v0.2-observation-protocol.md).
 
-## v0.3.0 — Durable processing jobs
+## v0.3.0 — Agent-operated Feishu daily digest
 
-**Goal:** decouple feed ingestion from translation and extraction only after v0.2 operational
-metrics show the need.
+**Goal:** reliably deliver topic-oriented Chinese news editions to a Feishu custom app bot before
+an explicit `Asia/Shanghai` deadline, while keeping Pi Agent outside deterministic scheduling,
+retry, credential, and delivery boundaries.
 
-- Split repository and CLI boundaries before changing scheduling semantics.
-- Add a SQLite jobs table with lease-based claims and crash recovery.
-- Move translation to bounded workers with provider limits, retry scheduling, and circuit
-  breaker state.
-- Evaluate extraction jobs only after translation jobs are stable.
+- Add versioned topic profiles, dynamic relevance-driven selection, content provenance, and daily
+  edition state with deterministic empty/degraded rendering.
+- Add a durable Feishu delivery outbox with bounded retry, idempotency, and delivery evidence.
+- Add cost observation and mandatory safety ceilings for background translation, Pi editorial work,
+  and delivery; set financial warn/enforce thresholds from measured operation.
+- Expose typed, audited feed/topic/edition operations so Pi does not need arbitrary production shell,
+  raw SQLite, or direct configuration-file access.
+- Use SQLite lease-based jobs where needed to decouple ingestion, translation, edition preparation,
+  and delivery, prioritize deadlines, and recover expired work after restart.
+- Keep full-text extraction explicit by default: use existing extracted text when present, otherwise
+  prefer RSS content and then summary.
+- Add authenticated, deduplicated, allowlisted inbound Feishu operation only after outbound delivery
+  is stable.
 
-See [ADR-0002](adr/0002-single-host-sqlite-job-queue.md). This version must include migration,
-recovery, and rollback drills.
+See [ADR-0002](adr/0002-single-host-sqlite-job-queue.md),
+[ADR-0003](adr/0003-agent-feishu-delivery-boundary.md), and the
+[v0.3 scope and acceptance plan](plans/2026-08-14-v0.3-agent-feishu-digest.md). Product approval
+opens design and bounded vertical-slice work; v0.2 observations still determine production polling,
+concurrency, retention, and cost limits. This version must include migration, deadline/fallback,
+crash recovery, delivery replay, backup/restore, and rollback drills.
 
 ## v0.4.0 — Trusted delivery
 
