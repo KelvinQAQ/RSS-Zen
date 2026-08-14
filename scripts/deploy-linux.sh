@@ -84,6 +84,8 @@ validate_project() {
     deploy/systemd/rss-zen-export-daily.timer \
     deploy/systemd/rss-zen-backup.service \
     deploy/systemd/rss-zen-backup.timer \
+    deploy/systemd/rss-zen-delivery.service \
+    deploy/systemd/rss-zen-delivery.timer \
     deploy/systemd/rss-zen.conf \
     deploy/systemd/rss-zen.env.example \
     deploy/sudoers/rss-zen-deploy \
@@ -237,6 +239,10 @@ install_system_files() {
     /etc/systemd/system/rss-zen-backup.service
   install -m 0644 "${PROJECT_DIR}/deploy/systemd/rss-zen-backup.timer" \
     /etc/systemd/system/rss-zen-backup.timer
+  install -m 0644 "${PROJECT_DIR}/deploy/systemd/rss-zen-delivery.service" \
+    /etc/systemd/system/rss-zen-delivery.service
+  install -m 0644 "${PROJECT_DIR}/deploy/systemd/rss-zen-delivery.timer" \
+    /etc/systemd/system/rss-zen-delivery.timer
   install -m 0644 "${PROJECT_DIR}/deploy/systemd/rss-zen.conf" /etc/tmpfiles.d/rss-zen.conf
   local control_tmp
   control_tmp="$(mktemp /usr/local/sbin/rss-zen-deploy-control.XXXXXX)"
@@ -266,7 +272,9 @@ install_system_files() {
     /etc/systemd/system/rss-zen-export@.service \
     /etc/systemd/system/rss-zen-export-daily.timer \
     /etc/systemd/system/rss-zen-backup.service \
-    /etc/systemd/system/rss-zen-backup.timer
+    /etc/systemd/system/rss-zen-backup.timer \
+    /etc/systemd/system/rss-zen-delivery.service \
+    /etc/systemd/system/rss-zen-delivery.timer
 }
 
 atomic_symlink() {

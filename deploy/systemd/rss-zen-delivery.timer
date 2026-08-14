@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodic RSS-Zen Feishu outbox delivery
+
+[Timer]
+OnCalendar=*-*-* *:*:00
+Persistent=true
+Unit=rss-zen-delivery.service
+
+[Install]
+WantedBy=timers.target

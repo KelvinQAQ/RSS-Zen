@@ -8,6 +8,7 @@ def test_systemd_assets_use_non_root_service_and_absolute_commands() -> None:
     export_service = Path("deploy/systemd/rss-zen-export@.service").read_text(encoding="utf-8")
     backup_service = Path("deploy/systemd/rss-zen-backup.service").read_text(encoding="utf-8")
     health_service = Path("deploy/systemd/rss-zen-healthcheck.service").read_text(encoding="utf-8")
+    delivery_service = Path("deploy/systemd/rss-zen-delivery.service").read_text(encoding="utf-8")
 
     assert "User=rss-zen" in service
     assert (
@@ -40,12 +41,19 @@ def test_systemd_assets_use_non_root_service_and_absolute_commands() -> None:
         "--config /etc/rss-zen/rss-zen.toml"
     ) in health_service
     assert "Restart=" not in health_service
+    assert "User=rss-zen" in delivery_service
+    assert (
+        "/opt/rss-zen/current/.venv/bin/rss-zen delivery-run --json "
+        "--config /etc/rss-zen/rss-zen.toml"
+    ) in delivery_service
+    assert "Restart=" not in delivery_service
 
 
 def test_timers_are_persistent_and_use_expected_units() -> None:
     export_timer = Path("deploy/systemd/rss-zen-export-daily.timer").read_text(encoding="utf-8")
     backup_timer = Path("deploy/systemd/rss-zen-backup.timer").read_text(encoding="utf-8")
     health_timer = Path("deploy/systemd/rss-zen-healthcheck.timer").read_text(encoding="utf-8")
+    delivery_timer = Path("deploy/systemd/rss-zen-delivery.timer").read_text(encoding="utf-8")
 
     assert "Persistent=true" in export_timer
     assert "Unit=rss-zen-export@daily.service" in export_timer
@@ -53,6 +61,8 @@ def test_timers_are_persistent_and_use_expected_units() -> None:
     assert "Unit=rss-zen-backup.service" in backup_timer
     assert "Persistent=true" in health_timer
     assert "Unit=rss-zen-healthcheck.service" in health_timer
+    assert "Persistent=true" in delivery_timer
+    assert "Unit=rss-zen-delivery.service" in delivery_timer
 
 
 def test_linux_documentation_covers_install_restore_and_single_instance_limit() -> None:
@@ -86,6 +96,9 @@ def test_guided_deployment_script_preserves_secrets_and_uses_locked_release() ->
     assert "LoadCredential=" in service
     assert "control wrapper self-check" in script
     assert "generated sudoers file failed validation" in script
+    assert "rss-zen-delivery.service" in script
+    assert "rss-zen-delivery.timer" in script
+    assert "enable --now rss-zen-delivery.timer" not in script
     sudoers = Path("deploy/sudoers/rss-zen-deploy").read_text(encoding="utf-8")
     control = Path("deploy/sudoers/rss-zen-deploy-control").read_text(encoding="utf-8")
     assert sudoers.strip() == "rss-zen-deploy ALL=(root) NOPASSWD: @CONTROL@"

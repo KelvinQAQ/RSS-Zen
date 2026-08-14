@@ -22,6 +22,18 @@ from rss_zen.markdown import escape_inline_text, safe_markdown_url
 
 
 @dataclass(frozen=True)
+class EditionPreview:
+    """A network-free, mutation-free deterministic selection estimate."""
+
+    article_ids: tuple[int, ...]
+    content_sources: tuple[str, ...]
+    article_count: int
+    translated_count: int
+    degraded: bool
+    rendered_bytes: int
+
+
+@dataclass(frozen=True)
 class EditionBuildResult:
     """One rendered and durably enqueued edition."""
 
@@ -42,6 +54,43 @@ class EditionBuilder:
         self._database = database
         self._target_language = target_language
         self._output_directory = output_directory
+
+    def preview(
+        self,
+        topic: TopicProfileRecord,
+        *,
+        local_date: str,
+        deadline_at: str,
+    ) -> EditionPreview:
+        """Select and render in memory without persisting an edition, artifact, or delivery."""
+        selected = self._fit_render_limit(
+            topic,
+            self._select(topic, deadline_at=deadline_at),
+            local_date=local_date,
+        )
+        sources = tuple(_content_source(record) for record in selected)
+        translated_count = sum(
+            1 for record in selected if record.translation.status == "succeeded"
+        )
+        degraded = any(
+            source.startswith("original_") or record.translation.status != "succeeded"
+            for source, record in zip(sources, selected, strict=True)
+        )
+        rendered = _render_edition(
+            topic,
+            local_date,
+            selected,
+            content_sources=sources,
+            degraded=degraded,
+        )
+        return EditionPreview(
+            article_ids=tuple(record.article.id for record in selected),
+            content_sources=sources,
+            article_count=len(selected),
+            translated_count=translated_count,
+            degraded=degraded,
+            rendered_bytes=len(rendered.encode("utf-8")),
+        )
 
     def build(
         self,

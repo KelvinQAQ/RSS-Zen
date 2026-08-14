@@ -153,6 +153,30 @@ sudo journalctl -u rss-zen-healthcheck.service -f
 A warning-only doctor result exits 0. Any doctor error exits 1, causing the oneshot unit to fail
 for observability; it does not restart `rss-zen.service`.
 
+### Optional Feishu delivery worker
+
+The installer places `rss-zen-delivery.service` and `rss-zen-delivery.timer` on the host but never
+enables them. Before staging activation, keep `[feishu].enabled = false`, inspect local work without
+claiming or sending it, and verify doctor output:
+
+```bash
+sudo -u rss-zen /opt/rss-zen/current/.venv/bin/rss-zen delivery-run --dry-run --json \
+  --config /etc/rss-zen/rss-zen.toml
+sudo -u rss-zen /opt/rss-zen/current/.venv/bin/rss-zen doctor --json \
+  --config /etc/rss-zen/rss-zen.toml
+```
+
+Only after the custom-app permissions, root-owned credential values, and `chat:` target have been
+approved should an operator set `[feishu].enabled = true`, run one explicit staging
+`delivery-run --json`, confirm the message and persisted delivery state, and then enable the timer:
+
+```bash
+sudo systemctl enable --now rss-zen-delivery.timer
+```
+
+The timer wakes one bounded worker batch per minute and is persistent across downtime. It does not
+build editions or invoke Pi; it sends only already-rendered, hash-verified outbox artifacts.
+
 `SIGTERM` and `SIGINT` stop scheduling new work and allow active bounded requests to finish;
 `TimeoutStopSec=120s` bounds shutdown. Feed synchronization retries transient fetches, while
 translation retries are persisted in SQLite with bounded exponential backoff. AnySearch

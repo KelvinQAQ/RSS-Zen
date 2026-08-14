@@ -6,8 +6,9 @@ import shutil
 import signal
 import sqlite3
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import httpx
 import typer
@@ -16,10 +17,13 @@ from rss_zen.backup import backup_database
 from rss_zen.budget import RunBudget
 from rss_zen.config import load_config
 from rss_zen.db import Database
+from rss_zen.delivery import DeliveryWorker
+from rss_zen.edition import EditionBuilder
 from rss_zen.errors import AppError, ConfigurationError
 from rss_zen.export import MarkdownExporter
 from rss_zen.extraction import AnySearchExtractor, ExtractionService
 from rss_zen.feeds import import_opml_file, normalize_feed_url, reconcile_config_feeds
+from rss_zen.feishu import FeishuClient
 from rss_zen.http_client import FeedHttpClient
 from rss_zen.logging import configure_logging
 from rss_zen.models import AppConfig
@@ -45,6 +49,17 @@ def _database_from_config(config_path: Path) -> tuple[Database, AppConfig]:
     database = Database(database_path)
     database.initialize()
     return database, config
+
+
+def _existing_database_from_config(config_path: Path) -> tuple[Database, AppConfig]:
+    """Load config and require an existing database without creating or migrating it."""
+    config = load_config(config_path)
+    database_path = config.database.path
+    if not database_path.is_absolute():
+        database_path = config_path.parent / database_path
+    if not database_path.is_file():
+        raise AppError("database_not_initialized", "database does not exist; run rss-zen init")
+    return Database(database_path), config
 
 
 def _handle_app_error(error: AppError) -> None:
@@ -943,6 +958,192 @@ def export_articles(
         f"export_run_id={result.export_run_id}"
     )
     typer.echo(message)
+
+
+@app.command("edition-build")
+def edition_build(
+    topic_key: str = typer.Option(..., "--topic"),
+    local_date: str | None = typer.Option(None, "--local-date"),
+    deadline_at: str | None = typer.Option(None, "--deadline-at"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    json_output: bool = typer.Option(False, "--json"),
+    config_path: Path = typer.Option(Path("rss-zen.toml"), "--config", "-c"),
+) -> None:
+    """Preview or durably build one topic edition without sending it."""
+    try:
+        if dry_run:
+            database, config = _existing_database_from_config(config_path)
+        else:
+            config = load_config(config_path)
+            if not config.feishu.enabled or config.feishu.target_ref is None:
+                raise AppError(
+                    "feishu_delivery_disabled",
+                    "Feishu delivery must be enabled with an approved target before enqueueing",
+                )
+            database_path = config.database.path
+            if not database_path.is_absolute():
+                database_path = config_path.parent / database_path
+            database = Database(database_path)
+            database.initialize()
+        topic = database.latest_topic_profile(topic_key)
+        if topic is None:
+            raise AppError("topic_not_found", "topic profile does not exist")
+        resolved_date, resolved_deadline = _edition_schedule(
+            topic.timezone,
+            topic.delivery_deadline,
+            local_date=local_date,
+            deadline_at=deadline_at,
+        )
+        builder = EditionBuilder(
+            database,
+            target_language=config.translation.target_language,
+            output_directory=database.path.parent / "editions",
+        )
+        if dry_run:
+            preview = builder.preview(
+                topic,
+                local_date=resolved_date,
+                deadline_at=resolved_deadline,
+            )
+            payload = {
+                "schema_version": 1,
+                "command": "edition-build",
+                "dry_run": True,
+                "topic": topic.key,
+                "topic_version": topic.version,
+                "local_date": resolved_date,
+                "deadline_at": resolved_deadline,
+                "article_count": preview.article_count,
+                "translated_count": preview.translated_count,
+                "degraded": preview.degraded,
+                "rendered_bytes": preview.rendered_bytes,
+                "content_sources": list(preview.content_sources),
+            }
+        else:
+            result = builder.build(
+                topic,
+                local_date=resolved_date,
+                deadline_at=resolved_deadline,
+                target_ref=config.feishu.target_ref,
+            )
+            payload = {
+                "schema_version": 1,
+                "command": "edition-build",
+                "dry_run": False,
+                "topic": topic.key,
+                "topic_version": topic.version,
+                "local_date": resolved_date,
+                "deadline_at": resolved_deadline,
+                "edition_run_id": result.edition.id,
+                "edition_status": result.edition.status,
+                "delivery_id": result.delivery.id,
+                "delivery_status": result.delivery.status,
+                "article_count": result.article_count,
+                "degraded": result.degraded,
+                "artifact_path": str(result.artifact_path),
+                "artifact_sha256": result.artifact_sha256,
+            }
+    except (AppError, ConfigurationError) as error:
+        _handle_app_error(error)
+        return
+    except (KeyError, ValueError, sqlite3.Error) as error:
+        _handle_app_error(AppError("edition_build_failed", "unable to build edition", cause=error))
+        return
+    if json_output:
+        _json_echo(payload)
+    else:
+        typer.echo(" ".join(f"{key}={value}" for key, value in payload.items()))
+
+
+@app.command("delivery-run")
+def delivery_run(
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    json_output: bool = typer.Option(False, "--json"),
+    config_path: Path = typer.Option(Path("rss-zen.toml"), "--config", "-c"),
+) -> None:
+    """Inspect or process one bounded Feishu delivery batch."""
+    try:
+        if dry_run:
+            database, config = _existing_database_from_config(config_path)
+            health = database.edition_delivery_health()
+            payload = {
+                "schema_version": 1,
+                "command": "delivery-run",
+                "dry_run": True,
+                "enabled": config.feishu.enabled,
+                "pending": health.delivery_pending,
+                "sending": health.delivery_sending,
+                "retry_wait": health.delivery_retry_wait,
+                "terminal": health.delivery_terminal,
+            }
+        else:
+            database, config = _database_from_config(config_path)
+            if not config.feishu.enabled:
+                raise AppError("feishu_delivery_disabled", "Feishu delivery is disabled")
+            if not config.feishu.app_id or not config.feishu.app_secret:
+                raise AppError(
+                    "feishu_credentials_missing",
+                    "Feishu credential environment variables are not set",
+                )
+            with httpx.Client(base_url=config.feishu.base_url, timeout=30.0) as client:
+                adapter = FeishuClient(
+                    client,
+                    app_id=config.feishu.app_id,
+                    app_secret=config.feishu.app_secret,
+                )
+                worker = DeliveryWorker(
+                    database,
+                    adapter,
+                    worker_id="rss-zen-delivery",
+                    max_attempts=config.feishu.max_attempts,
+                    batch_size=config.feishu.batch_size,
+                    lease_minutes=config.feishu.lease_minutes,
+                    max_backoff_minutes=config.feishu.max_backoff_minutes,
+                )
+                result = worker.run_once(now=datetime.now(UTC).isoformat())
+            payload = {
+                "schema_version": 1,
+                "command": "delivery-run",
+                "dry_run": False,
+                "claimed": result.claimed,
+                "delivered": result.delivered,
+                "retried": result.retried,
+                "terminal": result.terminal,
+            }
+    except (AppError, ConfigurationError) as error:
+        _handle_app_error(error)
+        return
+    except (ValueError, sqlite3.Error) as error:
+        _handle_app_error(
+            AppError("delivery_run_failed", "unable to process delivery batch", cause=error)
+        )
+        return
+    if json_output:
+        _json_echo(payload)
+    else:
+        typer.echo(" ".join(f"{key}={value}" for key, value in payload.items()))
+
+
+def _edition_schedule(
+    timezone: str,
+    delivery_deadline: str,
+    *,
+    local_date: str | None,
+    deadline_at: str | None,
+) -> tuple[str, str]:
+    zone = ZoneInfo(timezone)
+    local_day = date.fromisoformat(local_date) if local_date else datetime.now(zone).date()
+    if deadline_at is not None:
+        parsed = datetime.fromisoformat(deadline_at)
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError("deadline_at must include a UTC offset")
+        normalized = parsed.astimezone(UTC).isoformat()
+        if normalized != deadline_at:
+            raise ValueError("deadline_at must be a normalized UTC timestamp")
+        return local_day.isoformat(), normalized
+    local_time = time.fromisoformat(delivery_deadline)
+    deadline = datetime.combine(local_day, local_time, tzinfo=zone).astimezone(UTC)
+    return local_day.isoformat(), deadline.isoformat()
 
 
 @app.command("doctor")
