@@ -67,6 +67,17 @@ lease_minutes = 5
 max_backoff_minutes = 60
 budget_mode = "observe"
 
+# Optional bounded editorial pass. Keep disabled until provider/model/token limits are approved.
+[editorial]
+enabled = false
+executable = "pi"
+timeout_seconds = 300
+max_input_chars = 100000
+max_output_chars = 100000
+max_event_bytes = 2000000
+max_input_tokens = 100000
+max_output_tokens = 20000
+
 [[topics]]
 key = "indo-pacific"
 version = 1

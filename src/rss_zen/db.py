@@ -2058,23 +2058,32 @@ class Database:
         provider: str,
         response_bytes: int = 0,
         attempts: int = 0,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
     ) -> UsageTotals:
         """Add non-budget usage counters after local or external work."""
         _validate_usage_dimensions(local_date, category, provider)
-        if response_bytes < 0 or attempts < 0 or response_bytes + attempts < 1:
+        counters = (response_bytes, attempts, input_tokens, output_tokens)
+        if any(value < 0 for value in counters) or sum(counters) < 1:
             raise ValueError("usage counters must be nonnegative and non-empty")
         with self._connection() as connection:
             connection.execute(
                 """
                 INSERT INTO usage_daily(
-                    local_date, category, provider, response_bytes, attempts, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    local_date, category, provider, response_bytes, attempts,
+                    input_tokens, output_tokens, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(local_date, category, provider) DO UPDATE SET
                     response_bytes=response_bytes+excluded.response_bytes,
                     attempts=attempts+excluded.attempts,
+                    input_tokens=input_tokens+excluded.input_tokens,
+                    output_tokens=output_tokens+excluded.output_tokens,
                     updated_at=excluded.updated_at
                 """,
-                (local_date, category, provider, response_bytes, attempts, _utc_now()),
+                (
+                    local_date, category, provider, response_bytes, attempts,
+                    input_tokens, output_tokens, _utc_now(),
+                ),
             )
         return self.usage_totals(local_date=local_date, category=category, provider=provider)
 

@@ -64,6 +64,17 @@ lease_minutes = 5
 max_backoff_minutes = 60
 budget_mode = "observe"
 
+[editorial]
+enabled = false
+executable = "pi"
+timeout_seconds = 300
+max_input_chars = 100000
+max_output_chars = 100000
+max_event_bytes = 2000000
+max_input_tokens = 100000
+max_output_tokens = 20000
+# provider and model remain unset until separately approved.
+
 # Add reviewed topics before enabling the deadline coordinator timer.
 # [[topics]]
 # key = "indo-pacific"

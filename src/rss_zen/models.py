@@ -477,6 +477,30 @@ def _validate_headers(headers: dict[str, str], *, allow_secret_headers: bool = T
         raise ValueError("request headers must not exceed 8192 characters in total")
 
 
+class EditorialSettings(BaseModel):
+    """Inactive-by-default bounded Pi editorial subprocess policy."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    executable: str = "pi"
+    provider: str | None = None
+    model: str | None = None
+    timeout_seconds: int = Field(default=300, ge=1, le=900)
+    max_input_chars: int = Field(default=100_000, ge=1000, le=1_000_000)
+    max_output_chars: int = Field(default=100_000, ge=1000, le=1_000_000)
+    max_event_bytes: int = Field(default=2_000_000, ge=10_000, le=10_000_000)
+    max_input_tokens: int = Field(default=100_000, ge=1)
+    max_output_tokens: int = Field(default=20_000, ge=1)
+
+    @field_validator("executable")
+    @classmethod
+    def _safe_executable(cls, value: str) -> str:
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", value):
+            raise ValueError("editorial executable must be a basename without shell syntax")
+        return value
+
+
 class TopicSelectionSettings(BaseModel):
     """Deterministic, non-executable topic candidate rules."""
 
@@ -542,6 +566,7 @@ class AppConfig(BaseModel):
     translation: TranslationSettings
     anysearch: AnySearchSettings = Field(default_factory=AnySearchSettings)
     feishu: FeishuSettings = Field(default_factory=FeishuSettings)
+    editorial: EditorialSettings = Field(default_factory=EditorialSettings)
     feeds: list[FeedConfig] = Field(default_factory=list)
     exports: list[ExportProfile] = Field(default_factory=list)
     topics: list[TopicConfig] = Field(default_factory=list)
