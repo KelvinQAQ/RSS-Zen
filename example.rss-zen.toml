@@ -64,6 +64,27 @@ lease_minutes = 5
 max_backoff_minutes = 60
 budget_mode = "observe"
 
+[[topics]]
+key = "indo-pacific"
+version = 1
+name = "印太安全"
+timezone = "Asia/Shanghai"
+delivery_deadline = "07:30"
+lookback_hours = 24
+preparation_minutes = 60
+enabled = true
+
+[topics.selection]
+keywords = ["Taiwan", "Indo-Pacific", "South China Sea"]
+content_keywords = []
+keyword_match = "any"
+dedupe_by_title = true
+include_untranslated = true
+
+[topics.safety_limits]
+max_candidates = 100
+max_rendered_bytes = 1000000
+
 [[feeds]]
 name = "Example feed"
 url = "https://example.invalid/rss.xml"

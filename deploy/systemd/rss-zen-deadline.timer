@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodic RSS-Zen topic edition deadline coordination
+
+[Timer]
+OnCalendar=*-*-* *:*:00 Asia/Shanghai
+Persistent=true
+Unit=rss-zen-deadline.service
+
+[Install]
+WantedBy=timers.target

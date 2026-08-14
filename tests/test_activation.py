@@ -38,6 +38,24 @@ enabled = {str(enabled).lower()}
 app_id_env = "FEISHU_APP_ID"
 app_secret_env = "FEISHU_APP_SECRET"
 {"target_ref = \"chat:oc_approved\"" if enabled else ""}
+
+[[topics]]
+key = "indo-pacific"
+version = 1
+name = "印太安全"
+timezone = "Asia/Shanghai"
+delivery_deadline = "07:30"
+lookback_hours = 24
+preparation_minutes = 60
+enabled = true
+
+[topics.selection]
+keywords = ["Taiwan"]
+include_untranslated = false
+
+[topics.safety_limits]
+max_candidates = 10
+max_rendered_bytes = 100000
 """,
         encoding="utf-8",
     )
@@ -56,13 +74,18 @@ def _seed(database: Database) -> None:
             selection={
                 "keywords": ["Taiwan"],
                 "content_keywords": [],
+                "keyword_match": "any",
                 "sources": [],
                 "categories": [],
                 "feed_priority": [],
                 "dedupe_by_title": True,
                 "include_untranslated": False,
             },
-            safety_limits={"max_candidates": 10, "max_rendered_bytes": 100_000},
+            safety_limits={
+                "max_candidates": 10,
+                "max_rendered_bytes": 100_000,
+                "preparation_minutes": 60,
+            },
         )
     )
     assert topic.key == "indo-pacific"
@@ -195,6 +218,58 @@ def test_build_enqueues_but_delivery_dry_run_and_missing_credentials_do_not_clai
     assert refused.exit_code == 1
     assert "feishu_credentials_missing" in refused.stderr
     assert database.edition_delivery_health().delivery_pending == 1
+
+
+def test_deadline_run_dry_run_and_actual_are_idempotent(tmp_path: Path) -> None:
+    config = _config(tmp_path, enabled=True)
+    database = Database(tmp_path / "rss-zen.sqlite3")
+    database.initialize()
+    _seed(database)
+
+    preview = runner.invoke(
+        app,
+        [
+            "deadline-run",
+            "--dry-run",
+            "--now",
+            "2026-08-13T22:30:00+00:00",
+            "--json",
+            "--config",
+            str(config),
+        ],
+    )
+    assert preview.exit_code == 0
+    assert json.loads(preview.stdout)["topics"][0]["action"] == "would_build"
+    assert database.edition_delivery_health().edition_queued == 0
+
+    first = runner.invoke(
+        app,
+        [
+            "deadline-run",
+            "--now",
+            "2026-08-13T22:30:00+00:00",
+            "--json",
+            "--config",
+            str(config),
+        ],
+    )
+    repeated = runner.invoke(
+        app,
+        [
+            "deadline-run",
+            "--now",
+            "2026-08-13T23:00:00+00:00",
+            "--json",
+            "--config",
+            str(config),
+        ],
+    )
+    assert first.exit_code == 0
+    assert repeated.exit_code == 0
+    first_topic = json.loads(first.stdout)["topics"][0]
+    repeated_topic = json.loads(repeated.stdout)["topics"][0]
+    assert first_topic["edition_run_id"] == repeated_topic["edition_run_id"]
+    assert database.edition_delivery_health().edition_queued == 1
 
 
 def test_delivery_run_uses_mock_transport_and_persists_success(tmp_path: Path, monkeypatch) -> None:

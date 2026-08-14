@@ -6,6 +6,7 @@ import shutil
 import signal
 import sqlite3
 from collections.abc import Callable
+from dataclasses import asdict
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -16,6 +17,7 @@ import typer
 from rss_zen.backup import backup_database
 from rss_zen.budget import RunBudget
 from rss_zen.config import load_config
+from rss_zen.coordinator import DeadlineCoordinator
 from rss_zen.db import Database
 from rss_zen.delivery import DeliveryWorker
 from rss_zen.edition import EditionBuilder
@@ -1144,6 +1146,60 @@ def _edition_schedule(
     local_time = time.fromisoformat(delivery_deadline)
     deadline = datetime.combine(local_day, local_time, tzinfo=zone).astimezone(UTC)
     return local_day.isoformat(), deadline.isoformat()
+
+
+@app.command("deadline-run")
+def deadline_run(
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    now: str | None = typer.Option(None, "--now", help="Normalized UTC timestamp for testing."),
+    json_output: bool = typer.Option(False, "--json"),
+    config_path: Path = typer.Option(Path("rss-zen.toml"), "--config", "-c"),
+) -> None:
+    """Preview or build all configured topic editions whose preparation window is open."""
+    try:
+        instant = now or datetime.now(UTC).isoformat()
+        if dry_run:
+            database, config = _existing_database_from_config(config_path)
+            target_ref = config.feishu.target_ref or "chat:dry-run"
+        else:
+            config = load_config(config_path)
+            if not config.feishu.enabled or config.feishu.target_ref is None:
+                raise AppError(
+                    "feishu_delivery_disabled",
+                    "Feishu delivery must be enabled with an approved target",
+                )
+            database_path = config.database.path
+            if not database_path.is_absolute():
+                database_path = config_path.parent / database_path
+            database = Database(database_path)
+            database.initialize()
+            target_ref = config.feishu.target_ref
+        coordinator = DeadlineCoordinator(
+            database,
+            target_language=config.translation.target_language,
+            output_directory=database.path.parent / "editions",
+            target_ref=target_ref,
+        )
+        results = coordinator.run(config.topics, now=instant, dry_run=dry_run)
+        payload = {
+            "schema_version": 1,
+            "command": "deadline-run",
+            "dry_run": dry_run,
+            "now": instant,
+            "topics": [asdict(result) for result in results],
+        }
+    except (AppError, ConfigurationError) as error:
+        _handle_app_error(error)
+        return
+    except (KeyError, ValueError, sqlite3.Error) as error:
+        _handle_app_error(
+            AppError("deadline_run_failed", "unable to coordinate topic editions", cause=error)
+        )
+        return
+    if json_output:
+        _json_echo(payload)
+    else:
+        typer.echo(f"topics={len(payload['topics'])} dry_run={dry_run}")
 
 
 @app.command("doctor")

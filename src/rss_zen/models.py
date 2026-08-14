@@ -475,6 +475,58 @@ def _validate_headers(headers: dict[str, str], *, allow_secret_headers: bool = T
         raise ValueError("request headers must not exceed 8192 characters in total")
 
 
+class TopicSelectionSettings(BaseModel):
+    """Deterministic, non-executable topic candidate rules."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    keywords: list[str] = Field(default_factory=list)
+    content_keywords: list[str] = Field(default_factory=list)
+    keyword_match: Literal["any", "all", "groups"] = "any"
+    sources: list[str] = Field(default_factory=list)
+    categories: list[str] = Field(default_factory=list)
+    feed_priority: list[str] = Field(default_factory=list)
+    dedupe_by_title: bool = True
+    include_untranslated: bool = False
+
+
+class TopicSafetySettings(BaseModel):
+    """Mandatory non-financial edition safety ceilings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_candidates: int = Field(default=100, ge=1, le=1000)
+    max_rendered_bytes: int = Field(default=1_000_000, ge=1024, le=10_000_000)
+
+
+class TopicConfig(BaseModel):
+    """One current immutable topic-profile version from operator configuration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: str = Field(pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+    version: int = Field(ge=1)
+    name: str = Field(min_length=1, max_length=200)
+    timezone: str = "Asia/Shanghai"
+    delivery_deadline: str = Field(pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+    lookback_hours: int = Field(default=24, ge=1, le=744)
+    preparation_minutes: int = Field(default=60, ge=1, le=1440)
+    enabled: bool = True
+    selection: TopicSelectionSettings = Field(default_factory=TopicSelectionSettings)
+    safety_limits: TopicSafetySettings = Field(default_factory=TopicSafetySettings)
+
+    @field_validator("timezone")
+    @classmethod
+    def _installed_timezone(cls, value: str) -> str:
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+        try:
+            ZoneInfo(value)
+        except ZoneInfoNotFoundError as error:
+            raise ValueError("topic timezone must be an installed IANA timezone") from error
+        return value
+
+
 class AppConfig(BaseModel):
     """Complete application configuration after secret resolution."""
 
@@ -490,12 +542,16 @@ class AppConfig(BaseModel):
     feishu: FeishuSettings = Field(default_factory=FeishuSettings)
     feeds: list[FeedConfig] = Field(default_factory=list)
     exports: list[ExportProfile] = Field(default_factory=list)
+    topics: list[TopicConfig] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _export_names_are_unique(self) -> AppConfig:
         names = [profile.name.casefold() for profile in self.exports]
         if len(names) != len(set(names)):
             raise ValueError("duplicate export profile names are not allowed")
+        topic_keys = [topic.key for topic in self.topics]
+        if len(topic_keys) != len(set(topic_keys)):
+            raise ValueError("duplicate topic keys are not allowed")
         return self
 
     def effective_source_language(

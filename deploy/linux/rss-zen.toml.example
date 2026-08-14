@@ -62,6 +62,23 @@ lease_minutes = 5
 max_backoff_minutes = 60
 budget_mode = "observe"
 
+# Add reviewed topics before enabling the deadline coordinator timer.
+# [[topics]]
+# key = "indo-pacific"
+# version = 1
+# name = "Indo-Pacific"
+# timezone = "Asia/Shanghai"
+# delivery_deadline = "07:30"
+# lookback_hours = 24
+# preparation_minutes = 60
+# enabled = true
+# [topics.selection]
+# keywords = ["Taiwan", "Indo-Pacific"]
+# include_untranslated = true
+# [topics.safety_limits]
+# max_candidates = 100
+# max_rendered_bytes = 1000000
+
 # Add one or more HTTPS feeds after completing provider configuration.
 # [[feeds]]
 # name = "Example feed"

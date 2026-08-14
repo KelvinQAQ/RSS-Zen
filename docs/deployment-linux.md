@@ -177,6 +177,30 @@ sudo systemctl enable --now rss-zen-delivery.timer
 The timer wakes one bounded worker batch per minute and is persistent across downtime. It does not
 build editions or invoke Pi; it sends only already-rendered, hash-verified outbox artifacts.
 
+### Optional topic deadline coordinator
+
+The installer also places `rss-zen-deadline.service` and `rss-zen-deadline.timer` without enabling
+them. Configure and review one or more versioned `[[topics]]`, then preview an injected UTC time or
+the current clock without changing the database or filesystem:
+
+```bash
+sudo -u rss-zen /opt/rss-zen/current/.venv/bin/rss-zen deadline-run \
+  --dry-run --json --config /etc/rss-zen/rss-zen.toml
+```
+
+The coordinator timer uses an explicit `Asia/Shanghai` calendar and wakes every minute. It creates
+an edition only after each topic's preparation window opens, is idempotent across repeated wakes,
+and catches up for the current local date after downtime. It performs no feed/provider/Feishu
+network calls; it only renders and enqueues local editions. Enable it only after topic dry runs,
+Feishu staging delivery, and fallback content have been approved:
+
+```bash
+sudo systemctl enable --now rss-zen-deadline.timer
+```
+
+Enable the deadline and delivery timers separately so operators can stop generation or sending
+without coupling their failure domains.
+
 `SIGTERM` and `SIGINT` stop scheduling new work and allow active bounded requests to finish;
 `TimeoutStopSec=120s` bounds shutdown. Feed synchronization retries transient fetches, while
 translation retries are persisted in SQLite with bounded exponential backoff. AnySearch
