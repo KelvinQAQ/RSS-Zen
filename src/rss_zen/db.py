@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from rss_zen.backup import create_verified_sqlite_snapshot
 
@@ -253,6 +255,74 @@ class RetentionCounts:
     batch_runs: int = 0
 
 
+@dataclass(frozen=True)
+class TopicProfileInput:
+    """One immutable, versioned topic definition without credentials or article content."""
+
+    key: str
+    version: int
+    name: str
+    timezone: str
+    delivery_deadline: str
+    lookback_hours: int
+    selection: Mapping[str, object]
+    safety_limits: Mapping[str, object]
+    enabled: bool = True
+
+
+@dataclass(frozen=True)
+class TopicProfileRecord:
+    """A persisted immutable topic-profile version."""
+
+    id: int
+    key: str
+    version: int
+    name: str
+    timezone: str
+    delivery_deadline: str
+    lookback_hours: int
+    selection: Mapping[str, object]
+    safety_limits: Mapping[str, object]
+    enabled: bool
+
+
+@dataclass(frozen=True)
+class EditionRunRecord:
+    """One idempotent topic edition for a local calendar date."""
+
+    id: int
+    topic_profile_id: int
+    local_date: str
+    deadline_at: str
+    status: str
+    candidate_count: int
+    translated_count: int
+    degraded_reason_code: str | None
+    artifact_path: Path | None
+    artifact_sha256: str | None
+
+
+@dataclass(frozen=True)
+class DeliveryOutboxRecord:
+    """One durable, idempotent delivery attempt without a message body or credentials."""
+
+    id: int
+    edition_run_id: int
+    channel: str
+    target_ref: str
+    idempotency_key: str
+    artifact_path: Path
+    payload_sha256: str
+    status: str
+    attempt_count: int
+    next_attempt_at: str | None
+    lease_owner: str | None
+    lease_expires_at: str | None
+    provider_message_id: str | None
+    error_code: str | None
+    delivered_at: str | None
+
+
 _MIGRATION_1 = """
 CREATE TABLE IF NOT EXISTS feeds (
     id INTEGER PRIMARY KEY,
@@ -395,13 +465,118 @@ CREATE INDEX idx_batch_run_items_pending
 ON batch_run_items(batch_run_id, status, position);
 """
 
+_MIGRATION_5 = """
+CREATE TABLE topic_profiles (
+    id INTEGER PRIMARY KEY,
+    key TEXT NOT NULL,
+    version INTEGER NOT NULL CHECK(version >= 1),
+    name TEXT NOT NULL,
+    timezone TEXT NOT NULL,
+    delivery_deadline TEXT NOT NULL,
+    lookback_hours INTEGER NOT NULL CHECK(lookback_hours >= 1),
+    selection_json TEXT NOT NULL,
+    safety_limits_json TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    UNIQUE(key, version)
+);
+CREATE INDEX idx_topic_profiles_latest ON topic_profiles(key, version DESC);
+
+CREATE TABLE edition_runs (
+    id INTEGER PRIMARY KEY,
+    topic_profile_id INTEGER NOT NULL REFERENCES topic_profiles(id) ON DELETE RESTRICT,
+    local_date TEXT NOT NULL,
+    deadline_at TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN (
+        'planned', 'refreshing', 'selecting', 'frozen', 'editorial', 'rendered', 'degraded',
+        'queued', 'delivering', 'delivered', 'terminal'
+    )),
+    candidate_count INTEGER NOT NULL DEFAULT 0 CHECK(candidate_count >= 0),
+    translated_count INTEGER NOT NULL DEFAULT 0 CHECK(translated_count >= 0),
+    degraded_reason_code TEXT,
+    artifact_path TEXT,
+    artifact_sha256 TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    UNIQUE(topic_profile_id, local_date)
+);
+CREATE INDEX idx_edition_runs_status_deadline ON edition_runs(status, deadline_at);
+
+CREATE TABLE delivery_outbox (
+    id INTEGER PRIMARY KEY,
+    edition_run_id INTEGER NOT NULL REFERENCES edition_runs(id) ON DELETE RESTRICT,
+    channel TEXT NOT NULL CHECK(channel IN ('feishu')),
+    target_ref TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    artifact_path TEXT NOT NULL,
+    payload_sha256 TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN (
+        'pending', 'sending', 'retry_wait', 'delivered', 'terminal'
+    )),
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+    next_attempt_at TEXT,
+    lease_owner TEXT,
+    lease_expires_at TEXT,
+    provider_message_id TEXT,
+    error_code TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    delivered_at TEXT,
+    UNIQUE(edition_run_id, channel)
+);
+CREATE INDEX idx_delivery_outbox_due
+ON delivery_outbox(status, next_attempt_at, lease_expires_at, id);
+"""
+
 _MIGRATIONS: tuple[tuple[int, str], ...] = (
     (1, _MIGRATION_1),
     (2, _MIGRATION_2),
     (3, _MIGRATION_3),
     (4, _MIGRATION_4),
+    (5, _MIGRATION_5),
 )
 _PRE_MIGRATION_BACKUP_RETENTION_COUNT = 10
+
+_EDITION_TRANSITIONS: Mapping[str, frozenset[str]] = {
+    "planned": frozenset({"refreshing"}),
+    "refreshing": frozenset({"selecting", "degraded", "terminal"}),
+    "selecting": frozenset({"frozen", "degraded", "terminal"}),
+    "frozen": frozenset({"editorial", "rendered", "degraded", "terminal"}),
+    "editorial": frozenset({"rendered", "degraded", "terminal"}),
+    "rendered": frozenset({"queued"}),
+    "degraded": frozenset({"queued"}),
+    "queued": frozenset({"delivering", "terminal"}),
+    "delivering": frozenset({"queued", "delivered", "terminal"}),
+    "delivered": frozenset(),
+    "terminal": frozenset(),
+}
+_TOPIC_KEY_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+_DEADLINE_PATTERN = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_SENSITIVE_METADATA_KEYS = {
+    "api-key",
+    "api_key",
+    "authorization",
+    "body",
+    "content",
+    "full-text",
+    "full_text",
+    "summary",
+    "text",
+    "cookie",
+    "credential",
+    "credentials",
+    "password",
+    "secret",
+    "token",
+    "article-body",
+    "article_body",
+    "article-content",
+    "article_content",
+}
+_MAX_TOPIC_METADATA_BYTES = 65_536
+_MAX_TOPIC_METADATA_STRING_CHARS = 4_096
 
 
 class Database:
@@ -460,6 +635,461 @@ class Database:
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         return {str(row["name"]) for row in rows}
+
+    def create_topic_profile(self, item: TopicProfileInput) -> TopicProfileRecord:
+        """Persist one immutable topic version, returning an identical existing record."""
+        _validate_topic_profile(item)
+        selection_json = _json_object(item.selection, field="selection")
+        safety_limits_json = _json_object(item.safety_limits, field="safety_limits")
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO topic_profiles(
+                    key, version, name, timezone, delivery_deadline, lookback_hours,
+                    selection_json, safety_limits_json, enabled, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    item.key,
+                    item.version,
+                    item.name,
+                    item.timezone,
+                    item.delivery_deadline,
+                    item.lookback_hours,
+                    selection_json,
+                    safety_limits_json,
+                    int(item.enabled),
+                    _utc_now(),
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM topic_profiles WHERE key = ? AND version = ?",
+                (item.key, item.version),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("topic profile insert did not return a record")
+        record = _topic_profile_from_row(row)
+        if (
+            record.name != item.name
+            or record.timezone != item.timezone
+            or record.delivery_deadline != item.delivery_deadline
+            or record.lookback_hours != item.lookback_hours
+            or str(row["selection_json"]) != selection_json
+            or str(row["safety_limits_json"]) != safety_limits_json
+            or record.enabled != item.enabled
+        ):
+            raise ValueError("a different topic profile already uses this key and version")
+        return record
+
+    def latest_topic_profile(self, key: str) -> TopicProfileRecord | None:
+        """Return the newest immutable version of one topic key."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM topic_profiles WHERE key = ? ORDER BY version DESC LIMIT 1",
+                (key,),
+            ).fetchone()
+        return _topic_profile_from_row(row) if row is not None else None
+
+    def create_edition_run(
+        self, *, topic_profile_id: int, local_date: str, deadline_at: str
+    ) -> EditionRunRecord:
+        """Create one idempotent edition for a topic-profile version and local date."""
+        if topic_profile_id < 1:
+            raise ValueError("topic_profile_id must be positive")
+        _validate_date(local_date, field="local_date")
+        _validate_timestamp(deadline_at, field="deadline_at")
+        now = _utc_now()
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO edition_runs(
+                    topic_profile_id, local_date, deadline_at, status, created_at, updated_at
+                ) VALUES (?, ?, ?, 'planned', ?, ?)
+                """,
+                (topic_profile_id, local_date, deadline_at, now, now),
+            )
+            row = connection.execute(
+                """
+                SELECT * FROM edition_runs
+                WHERE topic_profile_id = ? AND local_date = ?
+                """,
+                (topic_profile_id, local_date),
+            ).fetchone()
+        if row is None:
+            raise KeyError(topic_profile_id)
+        record = _edition_run_from_row(row)
+        if record.deadline_at != deadline_at:
+            raise ValueError("edition already exists with a different deadline")
+        return record
+
+    def get_edition_run(self, run_id: int) -> EditionRunRecord:
+        """Return one edition run or raise KeyError."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM edition_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(run_id)
+        return _edition_run_from_row(row)
+
+    def transition_edition_run(
+        self,
+        run_id: int,
+        *,
+        status: str,
+        candidate_count: int | None = None,
+        translated_count: int | None = None,
+        degraded_reason_code: str | None = None,
+        artifact_path: Path | None = None,
+        artifact_sha256: str | None = None,
+    ) -> EditionRunRecord:
+        """Apply one validated edition lifecycle transition."""
+        if status not in _EDITION_TRANSITIONS:
+            raise ValueError("invalid edition status")
+        if status in {"queued", "delivering", "delivered"}:
+            raise ValueError("delivery edition states are managed by the outbox")
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM edition_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(run_id)
+            current = _edition_run_from_row(row)
+            if status not in _EDITION_TRANSITIONS[current.status]:
+                raise ValueError(f"invalid edition transition: {current.status} -> {status}")
+            next_candidates = (
+                current.candidate_count if candidate_count is None else candidate_count
+            )
+            next_translated = (
+                current.translated_count if translated_count is None else translated_count
+            )
+            if next_candidates < 0 or next_translated < 0:
+                raise ValueError("edition counts must be nonnegative")
+            if next_translated > next_candidates:
+                raise ValueError("translated_count cannot exceed candidate_count")
+            next_reason = degraded_reason_code or current.degraded_reason_code
+            next_path = artifact_path or current.artifact_path
+            next_hash = artifact_sha256 or current.artifact_sha256
+            if status == "degraded" and not next_reason:
+                raise ValueError("degraded edition requires a safe reason code")
+            if status in {"rendered", "degraded"}:
+                if next_path is None or next_hash is None:
+                    raise ValueError("rendered edition requires artifact path and SHA-256")
+                _validate_sha256(next_hash, field="artifact_sha256")
+            completed_at = _utc_now() if status in {"delivered", "terminal"} else None
+            connection.execute(
+                """
+                UPDATE edition_runs SET
+                    status = ?, candidate_count = ?, translated_count = ?,
+                    degraded_reason_code = ?, artifact_path = ?, artifact_sha256 = ?,
+                    updated_at = ?, completed_at = ?
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    next_candidates,
+                    next_translated,
+                    next_reason,
+                    str(next_path) if next_path is not None else None,
+                    next_hash,
+                    _utc_now(),
+                    completed_at,
+                    run_id,
+                ),
+            )
+            updated = connection.execute(
+                "SELECT * FROM edition_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+        if updated is None:
+            raise RuntimeError("edition transition did not return a record")
+        return _edition_run_from_row(updated)
+
+    def create_delivery_outbox_item(
+        self,
+        *,
+        edition_run_id: int,
+        channel: str,
+        target_ref: str,
+        idempotency_key: str,
+        artifact_path: Path,
+        payload_sha256: str,
+    ) -> DeliveryOutboxRecord:
+        """Enqueue artifact delivery without storing its content or provider credentials."""
+        if channel != "feishu":
+            raise ValueError("unsupported delivery channel")
+        if not target_ref or len(target_ref) > 255 or any(char.isspace() for char in target_ref):
+            raise ValueError("target_ref must be a bounded opaque reference")
+        if not idempotency_key or len(idempotency_key) > 255:
+            raise ValueError("idempotency_key must be non-empty and at most 255 characters")
+        if not str(artifact_path):
+            raise ValueError("artifact_path must be non-empty")
+        _validate_sha256(payload_sha256, field="payload_sha256")
+        now = _utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """
+                SELECT * FROM delivery_outbox
+                WHERE idempotency_key = ? OR (edition_run_id = ? AND channel = ?)
+                """,
+                (idempotency_key, edition_run_id, channel),
+            ).fetchone()
+            if existing is not None:
+                record = _delivery_outbox_from_row(existing)
+                if record.idempotency_key != idempotency_key:
+                    raise ValueError("edition already has a different channel delivery key")
+                _require_same_delivery(
+                    record,
+                    edition_run_id=edition_run_id,
+                    channel=channel,
+                    target_ref=target_ref,
+                    artifact_path=artifact_path,
+                    payload_sha256=payload_sha256,
+                )
+                return record
+            edition_row = connection.execute(
+                "SELECT * FROM edition_runs WHERE id = ?", (edition_run_id,)
+            ).fetchone()
+            if edition_row is None:
+                raise KeyError(edition_run_id)
+            edition = _edition_run_from_row(edition_row)
+            if edition.status not in {"rendered", "degraded"}:
+                raise ValueError("delivery requires a rendered or degraded edition")
+            if edition.artifact_path != artifact_path or edition.artifact_sha256 != payload_sha256:
+                raise ValueError("delivery artifact must match the edition artifact")
+            cursor = connection.execute(
+                """
+                INSERT INTO delivery_outbox(
+                    edition_run_id, channel, target_ref, idempotency_key, artifact_path,
+                    payload_sha256, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                """,
+                (
+                    edition_run_id,
+                    channel,
+                    target_ref,
+                    idempotency_key,
+                    str(artifact_path),
+                    payload_sha256,
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                "UPDATE edition_runs SET status = 'queued', updated_at = ? WHERE id = ?",
+                (now, edition_run_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM delivery_outbox WHERE id = ?", (cursor.lastrowid,)
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("delivery insert did not return a record")
+        return _delivery_outbox_from_row(row)
+
+    def get_delivery_outbox_item(self, item_id: int) -> DeliveryOutboxRecord:
+        """Return one durable delivery item or raise KeyError."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM delivery_outbox WHERE id = ?", (item_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(item_id)
+        return _delivery_outbox_from_row(row)
+
+    def claim_due_deliveries(
+        self,
+        *,
+        worker_id: str,
+        now: str,
+        lease_expires_at: str,
+        limit: int,
+    ) -> list[DeliveryOutboxRecord]:
+        """Atomically claim due or expired-lease delivery items in stable order."""
+        if not worker_id or len(worker_id) > 128:
+            raise ValueError("worker_id must be non-empty and bounded")
+        now_dt = _validate_timestamp(now, field="now")
+        lease_dt = _validate_timestamp(lease_expires_at, field="lease_expires_at")
+        if lease_dt <= now_dt:
+            raise ValueError("lease_expires_at must be later than now")
+        if limit < 1 or limit > 100:
+            raise ValueError("delivery claim limit must be between 1 and 100")
+        claimed: list[DeliveryOutboxRecord] = []
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """
+                SELECT delivery_outbox.id, delivery_outbox.edition_run_id
+                FROM delivery_outbox
+                JOIN edition_runs ON edition_runs.id = delivery_outbox.edition_run_id
+                WHERE edition_runs.status IN ('queued', 'delivering')
+                  AND (
+                    delivery_outbox.status = 'pending'
+                    OR (delivery_outbox.status = 'retry_wait'
+                        AND delivery_outbox.next_attempt_at <= ?)
+                    OR (delivery_outbox.status = 'sending'
+                        AND delivery_outbox.lease_expires_at <= ?)
+                  )
+                ORDER BY COALESCE(
+                    delivery_outbox.next_attempt_at, delivery_outbox.created_at
+                ), delivery_outbox.id
+                LIMIT ?
+                """,
+                (now, now, limit),
+            ).fetchall()
+            for row in rows:
+                item_id = int(row["id"])
+                edition_run_id = int(row["edition_run_id"])
+                connection.execute(
+                    """
+                    UPDATE delivery_outbox SET
+                        status = 'sending', attempt_count = attempt_count + 1,
+                        lease_owner = ?, lease_expires_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (worker_id, lease_expires_at, now, item_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE edition_runs SET status = 'delivering', updated_at = ?
+                    WHERE id = ? AND status IN ('queued', 'delivering')
+                    """,
+                    (now, edition_run_id),
+                )
+                updated = connection.execute(
+                    "SELECT * FROM delivery_outbox WHERE id = ?", (item_id,)
+                ).fetchone()
+                if updated is not None:
+                    claimed.append(_delivery_outbox_from_row(updated))
+        return claimed
+
+    def record_delivery_retry(
+        self,
+        item_id: int,
+        *,
+        worker_id: str,
+        error_code: str,
+        next_attempt_at: str,
+    ) -> DeliveryOutboxRecord:
+        """Release a held delivery lease into bounded retry state."""
+        _validate_error_code(error_code)
+        _validate_timestamp(next_attempt_at, field="next_attempt_at")
+        now = _utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            held = connection.execute(
+                """
+                SELECT edition_run_id FROM delivery_outbox
+                WHERE id = ? AND status = 'sending' AND lease_owner = ?
+                """,
+                (item_id, worker_id),
+            ).fetchone()
+            if held is None:
+                raise ValueError("delivery retry requires the current worker lease")
+            connection.execute(
+                """
+                UPDATE delivery_outbox SET
+                    status = 'retry_wait', error_code = ?, next_attempt_at = ?,
+                    lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (error_code, next_attempt_at, now, item_id),
+            )
+            connection.execute(
+                """
+                UPDATE edition_runs SET status = 'queued', updated_at = ?
+                WHERE id = ? AND status = 'delivering'
+                """,
+                (now, int(held["edition_run_id"])),
+            )
+            row = connection.execute(
+                "SELECT * FROM delivery_outbox WHERE id = ?", (item_id,)
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("delivery retry did not return a record")
+        return _delivery_outbox_from_row(row)
+
+    def record_delivery_success(
+        self, item_id: int, *, worker_id: str, provider_message_id: str
+    ) -> DeliveryOutboxRecord:
+        """Record confirmed provider delivery while holding the current lease."""
+        if not provider_message_id or len(provider_message_id) > 255:
+            raise ValueError("provider_message_id must be non-empty and bounded")
+        delivered_at = _utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            held = connection.execute(
+                """
+                SELECT edition_run_id FROM delivery_outbox
+                WHERE id = ? AND status = 'sending' AND lease_owner = ?
+                """,
+                (item_id, worker_id),
+            ).fetchone()
+            if held is None:
+                raise ValueError("delivery success requires the current worker lease")
+            connection.execute(
+                """
+                UPDATE delivery_outbox SET
+                    status = 'delivered', provider_message_id = ?, error_code = NULL,
+                    next_attempt_at = NULL, lease_owner = NULL, lease_expires_at = NULL,
+                    delivered_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (provider_message_id, delivered_at, delivered_at, item_id),
+            )
+            connection.execute(
+                """
+                UPDATE edition_runs SET status = 'delivered', updated_at = ?, completed_at = ?
+                WHERE id = ? AND status = 'delivering'
+                """,
+                (delivered_at, delivered_at, int(held["edition_run_id"])),
+            )
+            row = connection.execute(
+                "SELECT * FROM delivery_outbox WHERE id = ?", (item_id,)
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("delivery success did not return a record")
+        return _delivery_outbox_from_row(row)
+
+    def record_delivery_terminal(
+        self, item_id: int, *, worker_id: str, error_code: str
+    ) -> DeliveryOutboxRecord:
+        """Record a non-retryable delivery failure while holding the current lease."""
+        _validate_error_code(error_code)
+        now = _utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            held = connection.execute(
+                """
+                SELECT edition_run_id FROM delivery_outbox
+                WHERE id = ? AND status = 'sending' AND lease_owner = ?
+                """,
+                (item_id, worker_id),
+            ).fetchone()
+            if held is None:
+                raise ValueError("delivery terminal result requires the current worker lease")
+            connection.execute(
+                """
+                UPDATE delivery_outbox SET
+                    status = 'terminal', error_code = ?, next_attempt_at = NULL,
+                    lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (error_code, now, item_id),
+            )
+            connection.execute(
+                """
+                UPDATE edition_runs SET status = 'terminal', updated_at = ?, completed_at = ?
+                WHERE id = ? AND status = 'delivering'
+                """,
+                (now, now, int(held["edition_run_id"])),
+            )
+            row = connection.execute(
+                "SELECT * FROM delivery_outbox WHERE id = ?", (item_id,)
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("delivery terminal result did not return a record")
+        return _delivery_outbox_from_row(row)
 
     def upsert_feed(self, item: FeedInput) -> FeedRecord:
         """Create or update a feed by its canonical URL."""
@@ -1487,6 +2117,77 @@ def _count_before(
     return int(row[0])
 
 
+def _topic_profile_from_row(row: sqlite3.Row) -> TopicProfileRecord:
+    selection = _json_mapping_from_row(row, "selection_json")
+    safety_limits = _json_mapping_from_row(row, "safety_limits_json")
+    return TopicProfileRecord(
+        id=int(row["id"]),
+        key=str(row["key"]),
+        version=int(row["version"]),
+        name=str(row["name"]),
+        timezone=str(row["timezone"]),
+        delivery_deadline=str(row["delivery_deadline"]),
+        lookback_hours=int(row["lookback_hours"]),
+        selection=selection,
+        safety_limits=safety_limits,
+        enabled=bool(row["enabled"]),
+    )
+
+
+def _edition_run_from_row(row: sqlite3.Row) -> EditionRunRecord:
+    return EditionRunRecord(
+        id=int(row["id"]),
+        topic_profile_id=int(row["topic_profile_id"]),
+        local_date=str(row["local_date"]),
+        deadline_at=str(row["deadline_at"]),
+        status=str(row["status"]),
+        candidate_count=int(row["candidate_count"]),
+        translated_count=int(row["translated_count"]),
+        degraded_reason_code=row["degraded_reason_code"],
+        artifact_path=Path(str(row["artifact_path"])) if row["artifact_path"] else None,
+        artifact_sha256=row["artifact_sha256"],
+    )
+
+
+def _delivery_outbox_from_row(row: sqlite3.Row) -> DeliveryOutboxRecord:
+    return DeliveryOutboxRecord(
+        id=int(row["id"]),
+        edition_run_id=int(row["edition_run_id"]),
+        channel=str(row["channel"]),
+        target_ref=str(row["target_ref"]),
+        idempotency_key=str(row["idempotency_key"]),
+        artifact_path=Path(str(row["artifact_path"])),
+        payload_sha256=str(row["payload_sha256"]),
+        status=str(row["status"]),
+        attempt_count=int(row["attempt_count"]),
+        next_attempt_at=row["next_attempt_at"],
+        lease_owner=row["lease_owner"],
+        lease_expires_at=row["lease_expires_at"],
+        provider_message_id=row["provider_message_id"],
+        error_code=row["error_code"],
+        delivered_at=row["delivered_at"],
+    )
+
+
+def _require_same_delivery(
+    record: DeliveryOutboxRecord,
+    *,
+    edition_run_id: int,
+    channel: str,
+    target_ref: str,
+    artifact_path: Path,
+    payload_sha256: str,
+) -> None:
+    if (
+        record.edition_run_id != edition_run_id
+        or record.channel != channel
+        or record.target_ref != target_ref
+        or record.artifact_path != artifact_path
+        or record.payload_sha256 != payload_sha256
+    ):
+        raise ValueError("a different delivery already uses this idempotency key")
+
+
 def _batch_run_from_row(row: sqlite3.Row) -> BatchRunRecord:
     selector = json.loads(str(row["selector_json"]))
     limits = json.loads(str(row["limits_json"]))
@@ -1547,6 +2248,97 @@ def _article_hash(item: ArticleInput) -> str:
 
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _validate_topic_profile(item: TopicProfileInput) -> None:
+    if not _TOPIC_KEY_PATTERN.fullmatch(item.key):
+        raise ValueError("topic key must use lowercase letters, numbers, and single hyphens")
+    if item.version < 1:
+        raise ValueError("topic version must be positive")
+    if not item.name.strip() or len(item.name) > 200:
+        raise ValueError("topic name must be non-empty and at most 200 characters")
+    try:
+        ZoneInfo(item.timezone)
+    except ZoneInfoNotFoundError as error:
+        raise ValueError("topic timezone must be an installed IANA timezone") from error
+    if not _DEADLINE_PATTERN.fullmatch(item.delivery_deadline):
+        raise ValueError("delivery_deadline must use 24-hour HH:MM format")
+    if item.lookback_hours < 1 or item.lookback_hours > 24 * 31:
+        raise ValueError("lookback_hours must be between 1 and 744")
+    _reject_sensitive_metadata(item.selection)
+    _reject_sensitive_metadata(item.safety_limits)
+
+
+def _reject_sensitive_metadata(value: object, *, path: str = "metadata") -> None:
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            if not isinstance(key, str):
+                raise ValueError(f"{path} keys must be strings")
+            normalized = key.casefold().replace(" ", "-")
+            if normalized in _SENSITIVE_METADATA_KEYS:
+                raise ValueError(f"sensitive key is not allowed in {path}: {key}")
+            _reject_sensitive_metadata(nested, path=f"{path}.{key}")
+    elif isinstance(value, (list, tuple)):
+        for index, nested in enumerate(value):
+            _reject_sensitive_metadata(nested, path=f"{path}[{index}]")
+    elif isinstance(value, str):
+        if len(value) > _MAX_TOPIC_METADATA_STRING_CHARS:
+            raise ValueError(f"{path} string exceeds the topic metadata limit")
+    elif value is not None and not isinstance(value, (int, float, bool)):
+        raise ValueError(f"{path} contains a non-JSON value")
+
+
+def _json_object(value: Mapping[str, object], *, field: str) -> str:
+    _reject_sensitive_metadata(value, path=field)
+    try:
+        encoded = json.dumps(
+            dict(value), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{field} must be a JSON object") from error
+    if len(encoded.encode("utf-8")) > _MAX_TOPIC_METADATA_BYTES:
+        raise ValueError(f"{field} exceeds the topic metadata size limit")
+    return encoded
+
+
+def _json_mapping_from_row(row: sqlite3.Row, column: str) -> Mapping[str, object]:
+    value = json.loads(str(row[column]))
+    if not isinstance(value, dict):
+        raise ValueError(f"{column} must contain a JSON object")
+    return value
+
+
+def _validate_date(value: str, *, field: str) -> date:
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError as error:
+        raise ValueError(f"{field} must be an ISO calendar date") from error
+    if value != parsed.isoformat():
+        raise ValueError(f"{field} must use normalized YYYY-MM-DD format")
+    return parsed
+
+
+def _validate_timestamp(value: str, *, field: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as error:
+        raise ValueError(f"{field} must be an ISO timestamp") from error
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"{field} must include a UTC offset")
+    normalized = parsed.astimezone(UTC).isoformat()
+    if parsed.utcoffset().total_seconds() != 0 or value != normalized:
+        raise ValueError(f"{field} must be a normalized UTC timestamp")
+    return parsed
+
+
+def _validate_sha256(value: str, *, field: str) -> None:
+    if not _SHA256_PATTERN.fullmatch(value):
+        raise ValueError(f"{field} must be a lowercase SHA-256 digest")
+
+
+def _validate_error_code(value: str) -> None:
+    if not value or len(value) > 128 or not re.fullmatch(r"[a-z0-9_]+", value):
+        raise ValueError("error_code must use bounded lowercase snake_case")
 
 
 def _json_array(values: tuple[str, ...]) -> str:

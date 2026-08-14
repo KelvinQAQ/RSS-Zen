@@ -11,6 +11,7 @@ from rss_zen.db import (
     Database,
     ExtractionInput,
     FeedInput,
+    TopicProfileInput,
     TranslationInput,
 )
 
@@ -52,7 +53,7 @@ def _article(
 
 
 def test_initialization_creates_current_schema(database: Database) -> None:
-    assert database.schema_version() == 4
+    assert database.schema_version() == 5
     assert database.table_names() >= {
         "feeds",
         "articles",
@@ -60,6 +61,9 @@ def test_initialization_creates_current_schema(database: Database) -> None:
         "extractions",
         "export_runs",
         "sync_runs",
+        "topic_profiles",
+        "edition_runs",
+        "delivery_outbox",
     }
 
 
@@ -102,7 +106,38 @@ def test_migration_snapshot_includes_uncheckpointed_wal_data(tmp_path: Path) -> 
     with sqlite3.connect(snapshots[0]) as snapshot:
         assert snapshot.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert snapshot.execute("SELECT name FROM feeds").fetchone()[0] == "Stored in WAL"
-    assert Database(database_path).schema_version() == 4
+    assert Database(database_path).schema_version() == 5
+
+
+def test_schema_5_migration_snapshots_schema_4_before_changes(tmp_path: Path) -> None:
+    database_path = tmp_path / "rss-zen.sqlite3"
+    with sqlite3.connect(database_path) as connection:
+        connection.executescript(db_module._MIGRATION_1)
+        connection.executescript(db_module._MIGRATION_2)
+        connection.executescript(db_module._MIGRATION_3)
+        connection.executescript(db_module._MIGRATION_4)
+        connection.execute(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+        )
+        connection.executemany(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+            [(version, f"2026-08-14T00:00:0{version}+00:00") for version in range(1, 5)],
+        )
+
+    Database(database_path).initialize()
+
+    snapshots = list((tmp_path / "backups" / "pre-migration").glob("rss-zen-v4-to-v5-*.sqlite3"))
+    assert len(snapshots) == 1
+    with sqlite3.connect(snapshots[0]) as snapshot:
+        assert snapshot.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        version = snapshot.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+        tables = {
+            row[0]
+            for row in snapshot.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+    assert version == 4
+    assert "delivery_outbox" not in tables
+    assert Database(database_path).schema_version() == 5
 
 
 def test_schema_4_backup_restore_preserves_resumable_checkpoint(tmp_path: Path) -> None:
@@ -136,9 +171,306 @@ def test_schema_4_backup_restore_preserves_resumable_checkpoint(tmp_path: Path) 
     restored = Database(restored_path)
     restored.initialize()
 
-    assert restored.schema_version() == 4
+    assert restored.schema_version() == 5
     assert restored.get_batch_run(run.id).status == "interrupted"
     assert restored.batch_run_resumable_article_ids(run.id) == (second.id,)
+
+
+def _topic() -> TopicProfileInput:
+    return TopicProfileInput(
+        key="indo-pacific",
+        version=1,
+        name="Indo-Pacific",
+        timezone="Asia/Shanghai",
+        delivery_deadline="07:30",
+        lookback_hours=24,
+        selection={"keywords": ["Taiwan Strait", "AUKUS"]},
+        safety_limits={"max_candidates": 100, "max_agent_chars": 200_000},
+    )
+
+
+def test_topic_profile_versions_are_idempotent_and_reject_sensitive_metadata(
+    database: Database,
+) -> None:
+    created = database.create_topic_profile(_topic())
+    repeated = database.create_topic_profile(_topic())
+
+    assert repeated == created
+    assert database.latest_topic_profile("indo-pacific") == created
+
+    conflicting = TopicProfileInput(
+        **{**_topic().__dict__, "name": "Changed without a new version"}
+    )
+    with pytest.raises(ValueError, match="different topic profile"):
+        database.create_topic_profile(conflicting)
+
+    unsafe = TopicProfileInput(
+        **{**_topic().__dict__, "version": 2, "selection": {"api_key": "must-not-persist"}}
+    )
+    with pytest.raises(ValueError, match="sensitive key"):
+        database.create_topic_profile(unsafe)
+
+    article_body = TopicProfileInput(
+        **{**_topic().__dict__, "version": 2, "selection": {"content": "article body"}}
+    )
+    with pytest.raises(ValueError, match="sensitive key"):
+        database.create_topic_profile(article_body)
+
+    oversized = TopicProfileInput(
+        **{**_topic().__dict__, "version": 2, "selection": {"keywords": ["x" * 4097]}}
+    )
+    with pytest.raises(ValueError, match="metadata limit"):
+        database.create_topic_profile(oversized)
+
+
+def test_edition_identity_and_state_transitions_are_validated(database: Database) -> None:
+    topic = database.create_topic_profile(_topic())
+    edition = database.create_edition_run(
+        topic_profile_id=topic.id,
+        local_date="2026-08-14",
+        deadline_at="2026-08-13T23:30:00+00:00",
+    )
+    repeated = database.create_edition_run(
+        topic_profile_id=topic.id,
+        local_date="2026-08-14",
+        deadline_at="2026-08-13T23:30:00+00:00",
+    )
+    assert repeated == edition
+
+    refreshing = database.transition_edition_run(edition.id, status="refreshing")
+    selecting = database.transition_edition_run(
+        edition.id, status="selecting", candidate_count=12, translated_count=9
+    )
+    frozen = database.transition_edition_run(edition.id, status="frozen")
+    rendered = database.transition_edition_run(
+        edition.id,
+        status="rendered",
+        artifact_path=Path("editions/2026-08-14-indo-pacific.md"),
+        artifact_sha256="a" * 64,
+    )
+
+    assert refreshing.status == "refreshing"
+    assert selecting.candidate_count == 12
+    assert selecting.translated_count == 9
+    assert frozen.status == "frozen"
+    assert rendered.artifact_path == Path("editions/2026-08-14-indo-pacific.md")
+
+    with pytest.raises(ValueError, match="invalid edition transition"):
+        database.transition_edition_run(edition.id, status="refreshing")
+
+    with pytest.raises(ValueError, match="different deadline"):
+        database.create_edition_run(
+            topic_profile_id=topic.id,
+            local_date="2026-08-14",
+            deadline_at="2026-08-14T00:00:00+00:00",
+        )
+
+
+def test_delivery_outbox_is_idempotent_and_claims_due_work(database: Database) -> None:
+    topic = database.create_topic_profile(_topic())
+    edition = database.create_edition_run(
+        topic_profile_id=topic.id,
+        local_date="2026-08-14",
+        deadline_at="2026-08-13T23:30:00+00:00",
+    )
+    for status in ("refreshing", "selecting", "frozen"):
+        edition = database.transition_edition_run(edition.id, status=status)
+
+    with pytest.raises(ValueError, match="rendered or degraded"):
+        database.create_delivery_outbox_item(
+            edition_run_id=edition.id,
+            channel="feishu",
+            target_ref="chat:approved-digest",
+            idempotency_key="2026-08-14:indo-pacific:premature",
+            artifact_path=Path("editions/daily.md"),
+            payload_sha256="b" * 64,
+        )
+
+    edition = database.transition_edition_run(
+        edition.id,
+        status="rendered",
+        artifact_path=Path("editions/daily.md"),
+        artifact_sha256="b" * 64,
+    )
+    delivery = database.create_delivery_outbox_item(
+        edition_run_id=edition.id,
+        channel="feishu",
+        target_ref="chat:approved-digest",
+        idempotency_key="2026-08-14:indo-pacific:feishu",
+        artifact_path=Path("editions/daily.md"),
+        payload_sha256="b" * 64,
+    )
+    repeated = database.create_delivery_outbox_item(
+        edition_run_id=edition.id,
+        channel="feishu",
+        target_ref="chat:approved-digest",
+        idempotency_key="2026-08-14:indo-pacific:feishu",
+        artifact_path=Path("editions/daily.md"),
+        payload_sha256="b" * 64,
+    )
+    assert repeated == delivery
+    with pytest.raises(ValueError, match="different delivery"):
+        database.create_delivery_outbox_item(
+            edition_run_id=edition.id,
+            channel="feishu",
+            target_ref="chat:different-target",
+            idempotency_key="2026-08-14:indo-pacific:feishu",
+            artifact_path=Path("editions/daily.md"),
+            payload_sha256="b" * 64,
+        )
+    assert database.get_edition_run(edition.id).status == "queued"
+
+    claimed = database.claim_due_deliveries(
+        worker_id="delivery-1",
+        now="2026-08-14T00:00:00+00:00",
+        lease_expires_at="2026-08-14T00:05:00+00:00",
+        limit=10,
+    )
+    assert [item.id for item in claimed] == [delivery.id]
+    assert claimed[0].status == "sending"
+    assert claimed[0].attempt_count == 1
+    assert database.get_edition_run(edition.id).status == "delivering"
+
+    with pytest.raises(ValueError, match="current worker lease"):
+        database.record_delivery_retry(
+            delivery.id,
+            worker_id="wrong-worker",
+            error_code="feishu_rate_limited",
+            next_attempt_at="2026-08-14T00:10:00+00:00",
+        )
+
+    retrying = database.record_delivery_retry(
+        delivery.id,
+        worker_id="delivery-1",
+        error_code="feishu_rate_limited",
+        next_attempt_at="2026-08-14T00:10:00+00:00",
+    )
+    assert retrying.status == "retry_wait"
+    assert database.get_edition_run(edition.id).status == "queued"
+    assert database.claim_due_deliveries(
+        worker_id="delivery-2",
+        now="2026-08-14T00:09:59+00:00",
+        lease_expires_at="2026-08-14T00:15:00+00:00",
+        limit=10,
+    ) == []
+
+    reclaimed = database.claim_due_deliveries(
+        worker_id="delivery-2",
+        now="2026-08-14T00:10:00+00:00",
+        lease_expires_at="2026-08-14T00:15:00+00:00",
+        limit=10,
+    )
+    assert reclaimed[0].attempt_count == 2
+    delivered = database.record_delivery_success(
+        delivery.id, worker_id="delivery-2", provider_message_id="om_123"
+    )
+    assert delivered.status == "delivered"
+    assert delivered.provider_message_id == "om_123"
+    assert database.get_edition_run(edition.id).status == "delivered"
+    assert database.claim_due_deliveries(
+        worker_id="delivery-3",
+        now="2026-08-14T00:20:00+00:00",
+        lease_expires_at="2026-08-14T00:25:00+00:00",
+        limit=10,
+    ) == []
+
+
+def test_delivery_expired_lease_is_recovered_and_can_be_terminal(database: Database) -> None:
+    topic = database.create_topic_profile(_topic())
+    edition = database.create_edition_run(
+        topic_profile_id=topic.id,
+        local_date="2026-08-15",
+        deadline_at="2026-08-14T23:30:00+00:00",
+    )
+    for status in ("refreshing", "selecting", "frozen", "degraded"):
+        edition = database.transition_edition_run(
+            edition.id,
+            status=status,
+            degraded_reason_code="agent_unavailable" if status == "degraded" else None,
+            artifact_path=Path("editions/fallback.md") if status == "degraded" else None,
+            artifact_sha256="d" * 64 if status == "degraded" else None,
+        )
+    delivery = database.create_delivery_outbox_item(
+        edition_run_id=edition.id,
+        channel="feishu",
+        target_ref="chat:approved-digest",
+        idempotency_key="2026-08-15:indo-pacific:feishu",
+        artifact_path=Path("editions/fallback.md"),
+        payload_sha256="d" * 64,
+    )
+
+    first = database.claim_due_deliveries(
+        worker_id="crashed-worker",
+        now="2026-08-15T00:00:00+00:00",
+        lease_expires_at="2026-08-15T00:05:00+00:00",
+        limit=1,
+    )
+    assert first[0].attempt_count == 1
+    assert database.claim_due_deliveries(
+        worker_id="recovery-worker",
+        now="2026-08-15T00:04:59+00:00",
+        lease_expires_at="2026-08-15T00:09:59+00:00",
+        limit=1,
+    ) == []
+
+    recovered = database.claim_due_deliveries(
+        worker_id="recovery-worker",
+        now="2026-08-15T00:05:00+00:00",
+        lease_expires_at="2026-08-15T00:10:00+00:00",
+        limit=1,
+    )
+    assert recovered[0].id == delivery.id
+    assert recovered[0].attempt_count == 2
+
+    terminal = database.record_delivery_terminal(
+        delivery.id,
+        worker_id="recovery-worker",
+        error_code="feishu_target_invalid",
+    )
+    assert terminal.status == "terminal"
+    assert terminal.error_code == "feishu_target_invalid"
+    assert database.get_edition_run(edition.id).status == "terminal"
+
+
+def test_schema_5_backup_restore_preserves_pending_delivery(tmp_path: Path) -> None:
+    from rss_zen.backup import backup_database
+
+    database_path = tmp_path / "rss-zen.sqlite3"
+    database = Database(database_path)
+    database.initialize()
+    topic = database.create_topic_profile(_topic())
+    edition = database.create_edition_run(
+        topic_profile_id=topic.id,
+        local_date="2026-08-14",
+        deadline_at="2026-08-13T23:30:00+00:00",
+    )
+    for status in ("refreshing", "selecting", "frozen", "degraded"):
+        edition = database.transition_edition_run(
+            edition.id,
+            status=status,
+            degraded_reason_code="agent_unavailable" if status == "degraded" else None,
+            artifact_path=Path("editions/fallback.md") if status == "degraded" else None,
+            artifact_sha256="c" * 64 if status == "degraded" else None,
+        )
+    delivery = database.create_delivery_outbox_item(
+        edition_run_id=edition.id,
+        channel="feishu",
+        target_ref="chat:approved-digest",
+        idempotency_key="2026-08-14:indo-pacific:feishu",
+        artifact_path=Path("editions/fallback.md"),
+        payload_sha256="c" * 64,
+    )
+
+    backup = backup_database(database_path, tmp_path / "backups")
+    restored_path = tmp_path / "restored.sqlite3"
+    restored_path.write_bytes(backup.read_bytes())
+    restored = Database(restored_path)
+    restored.initialize()
+
+    assert restored.schema_version() == 5
+    assert restored.get_edition_run(edition.id).status == "queued"
+    assert restored.get_edition_run(edition.id).degraded_reason_code == "agent_unavailable"
+    assert restored.get_delivery_outbox_item(delivery.id).status == "pending"
 
 
 def test_retention_preview_counts_only_configured_candidates(database: Database) -> None:
