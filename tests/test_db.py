@@ -53,7 +53,7 @@ def _article(
 
 
 def test_initialization_creates_current_schema(database: Database) -> None:
-    assert database.schema_version() == 7
+    assert database.schema_version() == 8
     assert database.table_names() >= {
         "feeds",
         "articles",
@@ -107,7 +107,7 @@ def test_migration_snapshot_includes_uncheckpointed_wal_data(tmp_path: Path) -> 
     with sqlite3.connect(snapshots[0]) as snapshot:
         assert snapshot.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert snapshot.execute("SELECT name FROM feeds").fetchone()[0] == "Stored in WAL"
-    assert Database(database_path).schema_version() == 7
+    assert Database(database_path).schema_version() == 8
 
 
 def test_current_migrations_snapshot_schema_4_before_changes(tmp_path: Path) -> None:
@@ -127,7 +127,7 @@ def test_current_migrations_snapshot_schema_4_before_changes(tmp_path: Path) -> 
 
     Database(database_path).initialize()
 
-    snapshots = list((tmp_path / "backups" / "pre-migration").glob("rss-zen-v4-to-v7-*.sqlite3"))
+    snapshots = list((tmp_path / "backups" / "pre-migration").glob("rss-zen-v4-to-v8-*.sqlite3"))
     assert len(snapshots) == 1
     with sqlite3.connect(snapshots[0]) as snapshot:
         assert snapshot.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
@@ -138,7 +138,7 @@ def test_current_migrations_snapshot_schema_4_before_changes(tmp_path: Path) -> 
         }
     assert version == 4
     assert "delivery_outbox" not in tables
-    assert Database(database_path).schema_version() == 7
+    assert Database(database_path).schema_version() == 8
 
 
 def test_schema_5_upgrades_to_schema_6_without_redefining_migration_5(tmp_path: Path) -> None:
@@ -162,11 +162,9 @@ def test_schema_5_upgrades_to_schema_6_without_redefining_migration_5(tmp_path: 
 
     Database(database_path).initialize()
 
-    assert Database(database_path).schema_version() == 7
+    assert Database(database_path).schema_version() == 8
     assert "edition_run_items" in Database(database_path).table_names()
-    snapshots = list(
-        (tmp_path / "backups" / "pre-migration").glob("rss-zen-v5-to-v7-*.sqlite3")
-    )
+    snapshots = list((tmp_path / "backups" / "pre-migration").glob("rss-zen-v5-to-v8-*.sqlite3"))
     assert len(snapshots) == 1
 
 
@@ -201,7 +199,7 @@ def test_schema_4_backup_restore_preserves_resumable_checkpoint(tmp_path: Path) 
     restored = Database(restored_path)
     restored.initialize()
 
-    assert restored.schema_version() == 7
+    assert restored.schema_version() == 8
     assert restored.get_batch_run(run.id).status == "interrupted"
     assert restored.batch_run_resumable_article_ids(run.id) == (second.id,)
 
@@ -377,12 +375,15 @@ def test_delivery_outbox_is_idempotent_and_claims_due_work(database: Database) -
     )
     assert retrying.status == "retry_wait"
     assert database.get_edition_run(edition.id).status == "queued"
-    assert database.claim_due_deliveries(
-        worker_id="delivery-2",
-        now="2026-08-14T00:09:59+00:00",
-        lease_expires_at="2026-08-14T00:15:00+00:00",
-        limit=10,
-    ) == []
+    assert (
+        database.claim_due_deliveries(
+            worker_id="delivery-2",
+            now="2026-08-14T00:09:59+00:00",
+            lease_expires_at="2026-08-14T00:15:00+00:00",
+            limit=10,
+        )
+        == []
+    )
 
     reclaimed = database.claim_due_deliveries(
         worker_id="delivery-2",
@@ -397,12 +398,15 @@ def test_delivery_outbox_is_idempotent_and_claims_due_work(database: Database) -
     assert delivered.status == "delivered"
     assert delivered.provider_message_id == "om_123"
     assert database.get_edition_run(edition.id).status == "delivered"
-    assert database.claim_due_deliveries(
-        worker_id="delivery-3",
-        now="2026-08-14T00:20:00+00:00",
-        lease_expires_at="2026-08-14T00:25:00+00:00",
-        limit=10,
-    ) == []
+    assert (
+        database.claim_due_deliveries(
+            worker_id="delivery-3",
+            now="2026-08-14T00:20:00+00:00",
+            lease_expires_at="2026-08-14T00:25:00+00:00",
+            limit=10,
+        )
+        == []
+    )
 
 
 def test_delivery_expired_lease_is_recovered_and_can_be_terminal(database: Database) -> None:
@@ -436,12 +440,15 @@ def test_delivery_expired_lease_is_recovered_and_can_be_terminal(database: Datab
         limit=1,
     )
     assert first[0].attempt_count == 1
-    assert database.claim_due_deliveries(
-        worker_id="recovery-worker",
-        now="2026-08-15T00:04:59+00:00",
-        lease_expires_at="2026-08-15T00:09:59+00:00",
-        limit=1,
-    ) == []
+    assert (
+        database.claim_due_deliveries(
+            worker_id="recovery-worker",
+            now="2026-08-15T00:04:59+00:00",
+            lease_expires_at="2026-08-15T00:09:59+00:00",
+            limit=1,
+        )
+        == []
+    )
 
     recovered = database.claim_due_deliveries(
         worker_id="recovery-worker",
@@ -497,10 +504,39 @@ def test_schema_7_backup_restore_preserves_pending_delivery(tmp_path: Path) -> N
     restored = Database(restored_path)
     restored.initialize()
 
-    assert restored.schema_version() == 7
+    assert restored.schema_version() == 8
     assert restored.get_edition_run(edition.id).status == "queued"
     assert restored.get_edition_run(edition.id).degraded_reason_code == "agent_unavailable"
     assert restored.get_delivery_outbox_item(delivery.id).status == "pending"
+
+
+def test_editorial_result_is_persisted_before_and_after_agent_work(database: Database) -> None:
+    topic = database.create_topic_profile(_topic())
+    edition = database.create_edition_run(
+        topic_profile_id=topic.id,
+        local_date="2026-08-14",
+        deadline_at="2026-08-13T23:30:00+00:00",
+    )
+    database.transition_edition_run(edition.id, status="refreshing")
+    database.transition_edition_run(edition.id, status="selecting")
+    database.freeze_edition_items(edition.id, ())
+
+    assert database.begin_editorial(edition.id) is None
+    assert database.get_edition_run(edition.id).status == "editorial"
+    running = database.begin_editorial(edition.id)
+    assert running is not None
+    assert running["status"] == "running"
+
+    stored = database.finish_editorial(
+        edition.id,
+        title="每日汇编",
+        introduction="导语",
+        ordered_article_ids=(),
+        error_code=None,
+    )
+    assert stored["status"] == "succeeded"
+    assert stored["title"] == "每日汇编"
+    assert database.begin_editorial(edition.id) == stored
 
 
 def test_retention_preview_counts_only_configured_candidates(database: Database) -> None:
@@ -672,8 +708,11 @@ def test_list_articles_overview_filters_by_source_and_status(database: Database)
     # published_after excludes an earlier article timestamp.
     late = database.reconcile_article(
         feed.id,
-        _article(guid="article-2", canonical_url="https://example.test/articles/two",
-                 published_at="2026-08-12T10:00:00+00:00"),
+        _article(
+            guid="article-2",
+            canonical_url="https://example.test/articles/two",
+            published_at="2026-08-12T10:00:00+00:00",
+        ),
     )
     overviews = database.list_articles_overview(
         target_language="zh-CN", published_after="2026-08-12T00:00:00+00:00"

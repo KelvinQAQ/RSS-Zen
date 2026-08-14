@@ -612,6 +612,19 @@ CREATE TABLE usage_daily (
 CREATE INDEX idx_usage_daily_category_date ON usage_daily(category, local_date);
 """
 
+_MIGRATION_8 = """
+CREATE TABLE edition_editorial_results (
+    edition_run_id INTEGER PRIMARY KEY REFERENCES edition_runs(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK(status IN ('running', 'succeeded', 'fallback')),
+    title TEXT,
+    introduction TEXT,
+    ordered_article_ids_json TEXT,
+    error_code TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"""
+
 _MIGRATIONS: tuple[tuple[int, str], ...] = (
     (1, _MIGRATION_1),
     (2, _MIGRATION_2),
@@ -620,6 +633,7 @@ _MIGRATIONS: tuple[tuple[int, str], ...] = (
     (5, _MIGRATION_5),
     (6, _MIGRATION_6),
     (7, _MIGRATION_7),
+    (8, _MIGRATION_8),
 )
 _PRE_MIGRATION_BACKUP_RETENTION_COUNT = 10
 
@@ -889,6 +903,85 @@ class Database:
         if updated is None:
             raise RuntimeError("edition transition did not return a record")
         return _edition_run_from_row(updated)
+
+    def editorial_result(self, run_id: int) -> Mapping[str, object] | None:
+        """Return persisted bounded editorial metadata without article content."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM edition_editorial_results WHERE edition_run_id=?", (run_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        ordered = json.loads(row["ordered_article_ids_json"] or "[]")
+        return {
+            "status": str(row["status"]),
+            "title": row["title"],
+            "introduction": row["introduction"],
+            "ordered_article_ids": tuple(int(value) for value in ordered),
+            "error_code": row["error_code"],
+        }
+
+    def begin_editorial(self, run_id: int) -> Mapping[str, object] | None:
+        """Persist running before invoking Pi; return existing result for crash recovery."""
+        existing = self.editorial_result(run_id)
+        if existing is not None:
+            return existing
+        now = _utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT status FROM edition_runs WHERE id=?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(run_id)
+            if str(row["status"]) != "frozen":
+                raise ValueError("editorial can only begin for a frozen edition")
+            connection.execute(
+                """
+                INSERT INTO edition_editorial_results(
+                    edition_run_id, status, created_at, updated_at
+                ) VALUES (?, 'running', ?, ?)
+                """,
+                (run_id, now, now),
+            )
+            connection.execute(
+                "UPDATE edition_runs SET status='editorial', updated_at=? WHERE id=?",
+                (now, run_id),
+            )
+        return None
+
+    def finish_editorial(
+        self,
+        run_id: int,
+        *,
+        title: str | None,
+        introduction: str | None,
+        ordered_article_ids: tuple[int, ...],
+        error_code: str | None,
+    ) -> Mapping[str, object]:
+        """Persist either a successful edit or deterministic fallback decision."""
+        status = "fallback" if error_code else "succeeded"
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """UPDATE edition_editorial_results SET status=?, title=?, introduction=?,
+                ordered_article_ids_json=?, error_code=?, updated_at=?
+                WHERE edition_run_id=? AND status='running'""",
+                (
+                    status,
+                    title,
+                    introduction,
+                    json.dumps(ordered_article_ids),
+                    error_code,
+                    _utc_now(),
+                    run_id,
+                ),
+            )
+        if cursor.rowcount != 1:
+            raise ValueError("editorial result is not running")
+        result = self.editorial_result(run_id)
+        if result is None:
+            raise RuntimeError("editorial result was not persisted")
+        return result
 
     def freeze_edition_items(
         self, run_id: int, items: tuple[EditionItemInput, ...]
@@ -2081,8 +2174,14 @@ class Database:
                     updated_at=excluded.updated_at
                 """,
                 (
-                    local_date, category, provider, response_bytes, attempts,
-                    input_tokens, output_tokens, _utc_now(),
+                    local_date,
+                    category,
+                    provider,
+                    response_bytes,
+                    attempts,
+                    input_tokens,
+                    output_tokens,
+                    _utc_now(),
                 ),
             )
         return self.usage_totals(local_date=local_date, category=category, provider=provider)
@@ -2111,7 +2210,7 @@ class Database:
                        COALESCE(SUM(input_tokens),0) input_tokens,
                        COALESCE(SUM(output_tokens),0) output_tokens,
                        COALESCE(SUM(cost_microunits),0) cost_microunits
-                FROM usage_daily WHERE {' AND '.join(clauses)}
+                FROM usage_daily WHERE {" AND ".join(clauses)}
                 """,
                 values,
             ).fetchone()
@@ -2268,9 +2367,7 @@ class Database:
         """Return a run only when it belongs to the command requesting resume."""
         run = self.get_batch_run(run_id)
         if run.command != command:
-            raise ValueError(
-                f"batch run {run_id} command is {run.command}, not {command}"
-            )
+            raise ValueError(f"batch run {run_id} command is {run.command}, not {command}")
         return run
 
     def batch_run_pending_article_ids(self, run_id: int) -> tuple[int, ...]:
@@ -2469,9 +2566,7 @@ def _count_before(
     where = f"{timestamp_column} < ?"
     if extra_where:
         where += f" AND {extra_where}"
-    row = connection.execute(
-        f"SELECT COUNT(*) FROM {table} WHERE {where}", (cutoff,)
-    ).fetchone()
+    row = connection.execute(f"SELECT COUNT(*) FROM {table} WHERE {where}", (cutoff,)).fetchone()
     return int(row[0])
 
 
@@ -2666,9 +2761,7 @@ def _reject_sensitive_metadata(value: object, *, path: str = "metadata") -> None
 def _json_object(value: Mapping[str, object], *, field: str) -> str:
     _reject_sensitive_metadata(value, path=field)
     try:
-        encoded = json.dumps(
-            dict(value), ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        )
+        encoded = json.dumps(dict(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     except (TypeError, ValueError) as error:
         raise ValueError(f"{field} must be a JSON object") from error
     if len(encoded.encode("utf-8")) > _MAX_TOPIC_METADATA_BYTES:
