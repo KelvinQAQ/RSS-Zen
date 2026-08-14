@@ -139,7 +139,7 @@ api_key_env = "FREE_TRANSLATION_API_KEY"
     payload = _json.loads(result.stdout)
     assert payload["schema_version"] == 1
     assert payload["generated_at"]
-    assert payload["database"]["schema_version"] == 5
+    assert payload["database"]["schema_version"] == 6
     assert payload["database"]["size_bytes"] > 0
     assert payload["database"]["wal_size_bytes"] >= 0
     assert payload["disk"]["free_bytes"] > 0

@@ -303,6 +303,24 @@ class EditionRunRecord:
 
 
 @dataclass(frozen=True)
+class EditionItemInput:
+    """One selected article and its deterministic content-provenance decision."""
+
+    article_id: int
+    content_source: str
+
+
+@dataclass(frozen=True)
+class EditionItemRecord:
+    """One frozen edition candidate without duplicated article content."""
+
+    edition_run_id: int
+    article_id: int
+    position: int
+    content_source: str
+
+
+@dataclass(frozen=True)
 class DeliveryOutboxRecord:
     """One durable, idempotent delivery attempt without a message body or credentials."""
 
@@ -529,12 +547,30 @@ CREATE INDEX idx_delivery_outbox_due
 ON delivery_outbox(status, next_attempt_at, lease_expires_at, id);
 """
 
+_MIGRATION_6 = """
+CREATE TABLE edition_run_items (
+    edition_run_id INTEGER NOT NULL REFERENCES edition_runs(id) ON DELETE CASCADE,
+    article_id INTEGER NOT NULL REFERENCES articles(id) ON DELETE RESTRICT,
+    position INTEGER NOT NULL CHECK(position >= 0),
+    content_source TEXT NOT NULL CHECK(content_source IN (
+        'extracted_full_text', 'rss_content', 'rss_summary',
+        'original_rss_content', 'original_rss_summary'
+    )),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(edition_run_id, article_id),
+    UNIQUE(edition_run_id, position)
+);
+CREATE INDEX idx_edition_run_items_order
+ON edition_run_items(edition_run_id, position);
+"""
+
 _MIGRATIONS: tuple[tuple[int, str], ...] = (
     (1, _MIGRATION_1),
     (2, _MIGRATION_2),
     (3, _MIGRATION_3),
     (4, _MIGRATION_4),
     (5, _MIGRATION_5),
+    (6, _MIGRATION_6),
 )
 _PRE_MIGRATION_BACKUP_RETENTION_COUNT = 10
 
@@ -805,6 +841,93 @@ class Database:
             raise RuntimeError("edition transition did not return a record")
         return _edition_run_from_row(updated)
 
+    def freeze_edition_items(
+        self, run_id: int, items: tuple[EditionItemInput, ...]
+    ) -> tuple[EditionItemRecord, ...]:
+        """Freeze an ordered candidate set and advance selecting to frozen atomically."""
+        article_ids = tuple(item.article_id for item in items)
+        if len(article_ids) != len(set(article_ids)):
+            raise ValueError("edition article IDs must be unique")
+        allowed_sources = {
+            "extracted_full_text",
+            "rss_content",
+            "rss_summary",
+            "original_rss_content",
+            "original_rss_summary",
+        }
+        if any(item.article_id < 1 for item in items):
+            raise ValueError("edition article IDs must be positive")
+        if any(item.content_source not in allowed_sources for item in items):
+            raise ValueError("invalid edition content source")
+        now = _utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT status FROM edition_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(run_id)
+            existing = connection.execute(
+                """
+                SELECT * FROM edition_run_items
+                WHERE edition_run_id = ? ORDER BY position
+                """,
+                (run_id,),
+            ).fetchall()
+            if existing:
+                records = tuple(_edition_item_from_row(item) for item in existing)
+                expected = tuple(
+                    EditionItemRecord(run_id, item.article_id, position, item.content_source)
+                    for position, item in enumerate(items)
+                )
+                if records != expected:
+                    raise ValueError("edition candidates are already frozen differently")
+                return records
+            if str(row["status"]) != "selecting":
+                raise ValueError("edition candidates can only freeze while selecting")
+            connection.executemany(
+                """
+                INSERT INTO edition_run_items(
+                    edition_run_id, article_id, position, content_source, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                [
+                    (run_id, item.article_id, position, item.content_source, now)
+                    for position, item in enumerate(items)
+                ],
+            )
+            connection.execute(
+                """
+                UPDATE edition_runs SET status = 'frozen', candidate_count = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (len(items), now, run_id),
+            )
+            rows = connection.execute(
+                """
+                SELECT * FROM edition_run_items
+                WHERE edition_run_id = ? ORDER BY position
+                """,
+                (run_id,),
+            ).fetchall()
+        return tuple(_edition_item_from_row(row) for row in rows)
+
+    def edition_items(self, run_id: int) -> tuple[EditionItemRecord, ...]:
+        """Return frozen candidates in rendering order."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM edition_run_items
+                WHERE edition_run_id = ? ORDER BY position
+                """,
+                (run_id,),
+            ).fetchall()
+        return tuple(_edition_item_from_row(row) for row in rows)
+
+    def edition_item_article_ids(self, run_id: int) -> tuple[int, ...]:
+        """Return frozen candidate article IDs in rendering order."""
+        return tuple(item.article_id for item in self.edition_items(run_id))
+
     def create_delivery_outbox_item(
         self,
         *,
@@ -886,6 +1009,20 @@ class Database:
         if row is None:
             raise RuntimeError("delivery insert did not return a record")
         return _delivery_outbox_from_row(row)
+
+    def delivery_for_edition(
+        self, edition_run_id: int, *, channel: str
+    ) -> DeliveryOutboxRecord | None:
+        """Return the edition's channel delivery when already enqueued."""
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM delivery_outbox
+                WHERE edition_run_id = ? AND channel = ?
+                """,
+                (edition_run_id, channel),
+            ).fetchone()
+        return _delivery_outbox_from_row(row) if row is not None else None
 
     def get_delivery_outbox_item(self, item_id: int) -> DeliveryOutboxRecord:
         """Return one durable delivery item or raise KeyError."""
@@ -2146,6 +2283,15 @@ def _edition_run_from_row(row: sqlite3.Row) -> EditionRunRecord:
         degraded_reason_code=row["degraded_reason_code"],
         artifact_path=Path(str(row["artifact_path"])) if row["artifact_path"] else None,
         artifact_sha256=row["artifact_sha256"],
+    )
+
+
+def _edition_item_from_row(row: sqlite3.Row) -> EditionItemRecord:
+    return EditionItemRecord(
+        edition_run_id=int(row["edition_run_id"]),
+        article_id=int(row["article_id"]),
+        position=int(row["position"]),
+        content_source=str(row["content_source"]),
     )
 
 

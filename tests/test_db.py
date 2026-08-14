@@ -53,7 +53,7 @@ def _article(
 
 
 def test_initialization_creates_current_schema(database: Database) -> None:
-    assert database.schema_version() == 5
+    assert database.schema_version() == 6
     assert database.table_names() >= {
         "feeds",
         "articles",
@@ -63,6 +63,7 @@ def test_initialization_creates_current_schema(database: Database) -> None:
         "sync_runs",
         "topic_profiles",
         "edition_runs",
+        "edition_run_items",
         "delivery_outbox",
     }
 
@@ -106,10 +107,10 @@ def test_migration_snapshot_includes_uncheckpointed_wal_data(tmp_path: Path) -> 
     with sqlite3.connect(snapshots[0]) as snapshot:
         assert snapshot.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert snapshot.execute("SELECT name FROM feeds").fetchone()[0] == "Stored in WAL"
-    assert Database(database_path).schema_version() == 5
+    assert Database(database_path).schema_version() == 6
 
 
-def test_schema_5_migration_snapshots_schema_4_before_changes(tmp_path: Path) -> None:
+def test_current_migrations_snapshot_schema_4_before_changes(tmp_path: Path) -> None:
     database_path = tmp_path / "rss-zen.sqlite3"
     with sqlite3.connect(database_path) as connection:
         connection.executescript(db_module._MIGRATION_1)
@@ -126,7 +127,7 @@ def test_schema_5_migration_snapshots_schema_4_before_changes(tmp_path: Path) ->
 
     Database(database_path).initialize()
 
-    snapshots = list((tmp_path / "backups" / "pre-migration").glob("rss-zen-v4-to-v5-*.sqlite3"))
+    snapshots = list((tmp_path / "backups" / "pre-migration").glob("rss-zen-v4-to-v6-*.sqlite3"))
     assert len(snapshots) == 1
     with sqlite3.connect(snapshots[0]) as snapshot:
         assert snapshot.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
@@ -137,7 +138,36 @@ def test_schema_5_migration_snapshots_schema_4_before_changes(tmp_path: Path) ->
         }
     assert version == 4
     assert "delivery_outbox" not in tables
-    assert Database(database_path).schema_version() == 5
+    assert Database(database_path).schema_version() == 6
+
+
+def test_schema_5_upgrades_to_schema_6_without_redefining_migration_5(tmp_path: Path) -> None:
+    database_path = tmp_path / "rss-zen.sqlite3"
+    with sqlite3.connect(database_path) as connection:
+        for migration in (
+            db_module._MIGRATION_1,
+            db_module._MIGRATION_2,
+            db_module._MIGRATION_3,
+            db_module._MIGRATION_4,
+            db_module._MIGRATION_5,
+        ):
+            connection.executescript(migration)
+        connection.execute(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+        )
+        connection.executemany(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+            [(version, f"2026-08-14T00:00:0{version}+00:00") for version in range(1, 6)],
+        )
+
+    Database(database_path).initialize()
+
+    assert Database(database_path).schema_version() == 6
+    assert "edition_run_items" in Database(database_path).table_names()
+    snapshots = list(
+        (tmp_path / "backups" / "pre-migration").glob("rss-zen-v5-to-v6-*.sqlite3")
+    )
+    assert len(snapshots) == 1
 
 
 def test_schema_4_backup_restore_preserves_resumable_checkpoint(tmp_path: Path) -> None:
@@ -171,7 +201,7 @@ def test_schema_4_backup_restore_preserves_resumable_checkpoint(tmp_path: Path) 
     restored = Database(restored_path)
     restored.initialize()
 
-    assert restored.schema_version() == 5
+    assert restored.schema_version() == 6
     assert restored.get_batch_run(run.id).status == "interrupted"
     assert restored.batch_run_resumable_article_ids(run.id) == (second.id,)
 
@@ -432,7 +462,7 @@ def test_delivery_expired_lease_is_recovered_and_can_be_terminal(database: Datab
     assert database.get_edition_run(edition.id).status == "terminal"
 
 
-def test_schema_5_backup_restore_preserves_pending_delivery(tmp_path: Path) -> None:
+def test_schema_6_backup_restore_preserves_pending_delivery(tmp_path: Path) -> None:
     from rss_zen.backup import backup_database
 
     database_path = tmp_path / "rss-zen.sqlite3"
@@ -467,7 +497,7 @@ def test_schema_5_backup_restore_preserves_pending_delivery(tmp_path: Path) -> N
     restored = Database(restored_path)
     restored.initialize()
 
-    assert restored.schema_version() == 5
+    assert restored.schema_version() == 6
     assert restored.get_edition_run(edition.id).status == "queued"
     assert restored.get_edition_run(edition.id).degraded_reason_code == "agent_unavailable"
     assert restored.get_delivery_outbox_item(delivery.id).status == "pending"
