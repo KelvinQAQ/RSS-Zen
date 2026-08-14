@@ -17,6 +17,7 @@ from rss_zen.db import (
     ExportArticleRecord,
     TopicProfileRecord,
 )
+from rss_zen.editorial import EditorialRequest, EditorialService
 from rss_zen.export import _dedupe_by_title, _filter_by_keywords
 from rss_zen.markdown import escape_inline_text, safe_markdown_url
 
@@ -49,11 +50,17 @@ class EditionBuilder:
     """Build a deterministic edition without provider, extraction, Pi, or Feishu calls."""
 
     def __init__(
-        self, database: Database, *, target_language: str, output_directory: Path
+        self,
+        database: Database,
+        *,
+        target_language: str,
+        output_directory: Path,
+        editorial_service: EditorialService | None = None,
     ) -> None:
         self._database = database
         self._target_language = target_language
         self._output_directory = output_directory
+        self._editorial_service = editorial_service
 
     def preview(
         self,
@@ -69,9 +76,7 @@ class EditionBuilder:
             local_date=local_date,
         )
         sources = tuple(_content_source(record) for record in selected)
-        translated_count = sum(
-            1 for record in selected if record.translation.status == "succeeded"
-        )
+        translated_count = sum(1 for record in selected if record.translation.status == "succeeded")
         degraded = any(
             source.startswith("original_") or record.translation.status != "succeeded"
             for source, record in zip(sources, selected, strict=True)
@@ -117,9 +122,7 @@ class EditionBuilder:
             edition = self._database.transition_edition_run(edition.id, status="selecting")
         if edition.status == "selecting":
             selected = self._select(topic, deadline_at=deadline_at)
-            rendered_records = self._fit_render_limit(
-                topic, selected, local_date=local_date
-            )
+            rendered_records = self._fit_render_limit(topic, selected, local_date=local_date)
             items = tuple(
                 EditionItemInput(record.article.id, _content_source(record))
                 for record in rendered_records
@@ -138,8 +141,64 @@ class EditionBuilder:
             source.startswith("original_") or record.translation.status != "succeeded"
             for source, record in zip(frozen_sources, rendered_records, strict=True)
         )
+        editorial_title: str | None = None
+        editorial_introduction: str | None = None
+        persisted: object = None
+        if self._editorial_service is not None and edition.status in {"frozen", "editorial"}:
+            draft = _render_edition(
+                topic,
+                local_date,
+                rendered_records,
+                content_sources=frozen_sources,
+                degraded=degraded,
+            )
+            persisted = self._database.begin_editorial(edition.id)
+            if persisted is None:
+                attempt = self._editorial_service.attempt(
+                    EditorialRequest(
+                        topic.key,
+                        local_date,
+                        tuple(record.article.id for record in rendered_records),
+                        draft,
+                    )
+                )
+                result = attempt.result
+                persisted = self._database.finish_editorial(
+                    edition.id,
+                    title=result.title if result else None,
+                    introduction=result.introduction if result else None,
+                    ordered_article_ids=result.ordered_article_ids if result else (),
+                    error_code=attempt.error_code,
+                )
+            elif persisted["status"] == "running":
+                persisted = self._database.finish_editorial(
+                    edition.id,
+                    title=None,
+                    introduction=None,
+                    ordered_article_ids=(),
+                    error_code="editorial_interrupted",
+                )
+            if persisted["status"] == "succeeded":
+                order = tuple(persisted["ordered_article_ids"])
+                by_id = {
+                    record.article.id: (record, source)
+                    for record, source in zip(rendered_records, frozen_sources, strict=True)
+                }
+                rendered_records = [by_id[article_id][0] for article_id in order]
+                frozen_sources = tuple(by_id[article_id][1] for article_id in order)
+                editorial_title = str(persisted["title"])
+                editorial_introduction = str(persisted["introduction"])
+            else:
+                degraded = True
+            edition = self._database.get_edition_run(edition.id)
         rendered = _render_edition(
-            topic, local_date, rendered_records, content_sources=frozen_sources, degraded=degraded
+            topic,
+            local_date,
+            rendered_records,
+            content_sources=frozen_sources,
+            degraded=degraded,
+            editorial_title=editorial_title,
+            editorial_introduction=editorial_introduction,
         )
         encoded = rendered.encode("utf-8")
         max_rendered_bytes = _positive_limit(
@@ -149,7 +208,7 @@ class EditionBuilder:
             raise ValueError("rendered edition exceeds max_rendered_bytes")
         digest = hashlib.sha256(encoded).hexdigest()
 
-        if edition.status == "frozen":
+        if edition.status in {"frozen", "editorial"}:
             _atomic_write(artifact_path, rendered)
             edition = self._database.transition_edition_run(
                 edition.id,
@@ -157,7 +216,13 @@ class EditionBuilder:
                 translated_count=sum(
                     1 for record in rendered_records if record.translation.status == "succeeded"
                 ),
-                degraded_reason_code="translation_incomplete" if degraded else None,
+                degraded_reason_code=(
+                    str(persisted["error_code"])
+                    if self._editorial_service is not None
+                    and persisted
+                    and persisted["status"] == "fallback"
+                    else ("translation_incomplete" if degraded else None)
+                ),
                 artifact_path=artifact_path,
                 artifact_sha256=digest,
             )
@@ -189,9 +254,7 @@ class EditionBuilder:
             degraded=degraded,
         )
 
-    def _select(
-        self, topic: TopicProfileRecord, *, deadline_at: str
-    ) -> list[ExportArticleRecord]:
+    def _select(self, topic: TopicProfileRecord, *, deadline_at: str) -> list[ExportArticleRecord]:
         selection = topic.selection
         deadline = _utc_timestamp(deadline_at)
         published_after = (deadline - timedelta(hours=topic.lookback_hours)).isoformat()
@@ -282,12 +345,27 @@ class EditionBuilder:
             raise ValueError("queued edition is missing artifact metadata")
         records = self._records_for_frozen_items(edition.id)
         sources = tuple(item.content_source for item in self._database.edition_items(edition.id))
+        editorial = self._database.editorial_result(edition.id)
+        title = None
+        introduction = None
+        if editorial and editorial["status"] == "succeeded":
+            by_id = {
+                record.article.id: (record, source)
+                for record, source in zip(records, sources, strict=True)
+            }
+            order = tuple(editorial["ordered_article_ids"])
+            records = [by_id[article_id][0] for article_id in order]
+            sources = tuple(by_id[article_id][1] for article_id in order)
+            title = str(editorial["title"])
+            introduction = str(editorial["introduction"])
         rendered = _render_edition(
             topic,
             edition.local_date,
             records,
             content_sources=sources,
             degraded=edition.degraded_reason_code is not None,
+            editorial_title=title,
+            editorial_introduction=introduction,
         )
         encoded = rendered.encode("utf-8")
         digest = hashlib.sha256(encoded).hexdigest()
@@ -312,9 +390,14 @@ def _render_edition(
     *,
     content_sources: tuple[str, ...] | None = None,
     degraded: bool,
+    editorial_title: str | None = None,
+    editorial_introduction: str | None = None,
 ) -> str:
     suffix = "（降级版）" if degraded else ""
-    lines = [f"# {escape_inline_text(topic.name)} — {local_date}{suffix}", ""]
+    heading = editorial_title or f"{topic.name} — {local_date}"
+    lines = [f"# {escape_inline_text(heading)}{suffix}", ""]
+    if editorial_introduction:
+        lines.extend([escape_inline_text(editorial_introduction), ""])
     if not records:
         lines.extend(["今日无符合主题的更新。", ""])
     sources = content_sources or tuple(_content_source(record) for record in records)

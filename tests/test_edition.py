@@ -13,6 +13,7 @@ from rss_zen.db import (
     TranslationInput,
 )
 from rss_zen.edition import EditionBuilder
+from rss_zen.editorial import EditorialAttempt, EditorialResult
 
 
 def _database(tmp_path: Path) -> Database:
@@ -188,6 +189,89 @@ def test_builder_is_idempotent_after_artifact_and_outbox_are_created(tmp_path: P
             deadline_at="2026-08-13T23:30:00+00:00",
             target_ref="chat:different-target",
         )
+
+
+def test_builder_applies_and_persists_editorial_order_before_outbox(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    topic = _topic(database, max_candidates=2)
+    first = _article(database, guid="a1", title="Taiwan first")
+    second = _article(database, guid="a2", title="Taiwan second")
+    _translate(database, first, title="第一篇", summary="摘要一")
+    _translate(database, second, title="第二篇", summary="摘要二")
+
+    class Editorial:
+        calls = 0
+
+        def attempt(self, request):
+            self.calls += 1
+            return EditorialAttempt(
+                EditorialResult(
+                    "编辑标题", "编辑导语", tuple(reversed(request.article_ids)), 10, 5
+                ),
+                False,
+            )
+
+    editorial = Editorial()
+    builder = EditionBuilder(
+        database,
+        target_language="zh-CN",
+        output_directory=tmp_path / "editions",
+        editorial_service=editorial,
+    )
+    result = builder.build(
+        topic,
+        local_date="2026-08-14",
+        deadline_at="2026-08-13T23:30:00+00:00",
+        target_ref="chat:approved-digest",
+    )
+    rendered = result.artifact_path.read_text(encoding="utf-8")
+    assert rendered.startswith("# 编辑标题\n\n编辑导语")
+    assert rendered.index("第一篇") < rendered.index("第二篇")
+    assert editorial.calls == 1
+    result.artifact_path.unlink()
+    builder.build(
+        topic,
+        local_date="2026-08-14",
+        deadline_at="2026-08-13T23:30:00+00:00",
+        target_ref="chat:approved-digest",
+    )
+    assert editorial.calls == 1
+    assert result.artifact_path.read_text(encoding="utf-8").startswith("# 编辑标题")
+
+
+def test_builder_recovers_running_editorial_as_fallback_without_calling_agent(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    topic = _topic(database, keywords=["No match"])
+    edition = database.create_edition_run(
+        topic_profile_id=topic.id,
+        local_date="2026-08-14",
+        deadline_at="2026-08-13T23:30:00+00:00",
+    )
+    database.transition_edition_run(edition.id, status="refreshing")
+    database.transition_edition_run(edition.id, status="selecting")
+    database.freeze_edition_items(edition.id, ())
+    database.begin_editorial(edition.id)
+
+    class MustNotRun:
+        def attempt(self, request):
+            raise AssertionError("agent must not rerun after interrupted state")
+
+    result = EditionBuilder(
+        database,
+        target_language="zh-CN",
+        output_directory=tmp_path / "editions",
+        editorial_service=MustNotRun(),
+    ).build(
+        topic,
+        local_date="2026-08-14",
+        deadline_at="2026-08-13T23:30:00+00:00",
+        target_ref="chat:approved-digest",
+    )
+    assert result.degraded is True
+    assert result.edition.degraded_reason_code == "editorial_interrupted"
+    assert "降级版" in result.artifact_path.read_text(encoding="utf-8")
 
 
 def test_builder_renders_a_successful_empty_edition(tmp_path: Path) -> None:

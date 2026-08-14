@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 from rss_zen.db import Database, TopicProfileRecord
 from rss_zen.edition import EditionBuilder
+from rss_zen.editorial import EditorialService
 from rss_zen.models import TopicConfig
 from rss_zen.topics import reconcile_config_topics, topic_input, validate_config_topics
 
@@ -37,11 +38,13 @@ class DeadlineCoordinator:
         target_language: str,
         output_directory: Path,
         target_ref: str,
+        editorial_service: EditorialService | None = None,
     ) -> None:
         self._database = database
         self._target_language = target_language
         self._output_directory = output_directory
         self._target_ref = target_ref
+        self._editorial_service = editorial_service
 
     def run(
         self, topics: list[TopicConfig], *, now: str, dry_run: bool
@@ -79,6 +82,7 @@ class DeadlineCoordinator:
                 self._database,
                 target_language=self._target_language,
                 output_directory=self._output_directory,
+                editorial_service=self._editorial_service,
             )
             if dry_run:
                 preview = builder.preview(

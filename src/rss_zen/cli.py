@@ -21,6 +21,7 @@ from rss_zen.coordinator import DeadlineCoordinator
 from rss_zen.db import Database
 from rss_zen.delivery import DeliveryWorker
 from rss_zen.edition import EditionBuilder
+from rss_zen.editorial import EditorialService, PiEditorialRunner
 from rss_zen.errors import AppError, ConfigurationError
 from rss_zen.export import MarkdownExporter
 from rss_zen.extraction import AnySearchExtractor, ExtractionService
@@ -62,6 +63,12 @@ def _existing_database_from_config(config_path: Path) -> tuple[Database, AppConf
     if not database_path.is_file():
         raise AppError("database_not_initialized", "database does not exist; run rss-zen init")
     return Database(database_path), config
+
+
+def _editorial_service(database: Database, config: AppConfig) -> EditorialService | None:
+    if not config.editorial.enabled:
+        return None
+    return EditorialService(database, PiEditorialRunner(config.editorial))
 
 
 def _handle_app_error(error: AppError) -> None:
@@ -408,14 +415,12 @@ def translate(
                 config.translation.target_language, status=status_filter, limit=effective_limit
             )
         else:
-            articles = database.list_articles(
-                article_ids=selected_ids, source=source
-            )[:effective_limit]
+            articles = database.list_articles(article_ids=selected_ids, source=source)[
+                :effective_limit
+            ]
         if not articles:
             raise AppError("article_not_found", "no article matches the requested selector")
-        budget = _run_budget(
-            config, max_requests=max_requests, max_source_chars=max_source_chars
-        )
+        budget = _run_budget(config, max_requests=max_requests, max_source_chars=max_source_chars)
         if resume is not None and not checkpoint:
             raise AppError("invalid_resume_checkpoint", "--resume requires checkpointing")
         if not dry_run and batch_run is None and checkpoint:
@@ -432,9 +437,7 @@ def translate(
         if dry_run:
             for article in articles:
                 typer.echo(f"article_id={article.id} title={article.title}")
-            _write_batch_report(
-                report_json, _dry_run_report("translate", articles, config, budget)
-            )
+            _write_batch_report(report_json, _dry_run_report("translate", articles, config, budget))
             typer.echo(f"selected={len(articles)} dry_run=true")
             return
         with httpx.Client(timeout=30.0) as client:
@@ -465,8 +468,7 @@ def translate(
                         raise
                     budget_error = error
                     skipped = [
-                        {"article_id": item.id, "reason": error.code}
-                        for item in articles[index:]
+                        {"article_id": item.id, "reason": error.code} for item in articles[index:]
                     ]
                     if batch_run is not None:
                         for item in articles[index:]:
@@ -598,9 +600,7 @@ def extract(
             )[:effective_limit]
         if not articles:
             raise AppError("article_not_found", "no article matches the requested selector")
-        budget = _run_budget(
-            config, max_requests=max_requests, max_source_chars=max_source_chars
-        )
+        budget = _run_budget(config, max_requests=max_requests, max_source_chars=max_source_chars)
         if resume is not None and not checkpoint:
             raise AppError("invalid_resume_checkpoint", "--resume requires checkpointing")
         if not dry_run and batch_run is None and checkpoint:
@@ -619,9 +619,7 @@ def extract(
         if dry_run:
             for article in articles:
                 typer.echo(f"article_id={article.id} title={article.title}")
-            _write_batch_report(
-                report_json, _dry_run_report("extract", articles, config, budget)
-            )
+            _write_batch_report(report_json, _dry_run_report("extract", articles, config, budget))
             typer.echo(f"selected={len(articles)} dry_run=true")
             return
         with httpx.Client(timeout=30.0) as client:
@@ -658,8 +656,7 @@ def extract(
                         raise
                     budget_error = error
                     skipped = [
-                        {"article_id": item.id, "reason": error.code}
-                        for item in articles[index:]
+                        {"article_id": item.id, "reason": error.code} for item in articles[index:]
                     ]
                     if batch_run is not None:
                         for item in articles[index:]:
@@ -1004,6 +1001,7 @@ def edition_build(
             database,
             target_language=config.translation.target_language,
             output_directory=database.path.parent / "editions",
+            editorial_service=None if dry_run else _editorial_service(database, config),
         )
         if dry_run:
             preview = builder.preview(
@@ -1183,6 +1181,7 @@ def deadline_run(
             target_language=config.translation.target_language,
             output_directory=database.path.parent / "editions",
             target_ref=target_ref,
+            editorial_service=None if dry_run else _editorial_service(database, config),
         )
         results = coordinator.run(config.topics, now=instant, dry_run=dry_run)
         payload = {
@@ -1340,9 +1339,7 @@ def doctor(
         try:
             feeds = database.list_feeds()
             enabled = [feed for feed in feeds if feed.enabled]
-            never_succeeded = [
-                feed for feed in enabled if feed.last_success_at is None
-            ]
+            never_succeeded = [feed for feed in enabled if feed.last_success_at is None]
             latest_success = max(
                 (feed.last_success_at for feed in feeds if feed.last_success_at), default=None
             )
@@ -1633,9 +1630,7 @@ def status(
         typer.echo(f"{error.workflow}_error={error.error_code} count={error.count}")
 
 
-def _is_feed_stale(
-    feed: object, *, default_poll_interval_minutes: int, now: datetime
-) -> bool:
+def _is_feed_stale(feed: object, *, default_poll_interval_minutes: int, now: datetime) -> bool:
     """Return whether an enabled feed has never succeeded or missed two poll windows."""
     last_success = feed.last_success_at
     if last_success is None:
