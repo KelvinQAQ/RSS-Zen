@@ -52,6 +52,18 @@ zone = "intl"
 language = "zh-CN"
 max_results = 3
 
+# Feishu delivery remains inactive until an approved custom app and chat target are configured.
+[feishu]
+enabled = false
+app_id_env = "FEISHU_APP_ID"
+app_secret_env = "FEISHU_APP_SECRET"
+# target_ref = "chat:oc_approved"
+batch_size = 10
+max_attempts = 5
+lease_minutes = 5
+max_backoff_minutes = 60
+budget_mode = "observe"
+
 [[feeds]]
 name = "Example feed"
 url = "https://example.invalid/rss.xml"

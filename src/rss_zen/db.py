@@ -246,6 +246,23 @@ class BatchHealthCounts:
 
 
 @dataclass(frozen=True)
+class EditionDeliveryHealth:
+    """Aggregate edition and outbox state without content or target identifiers."""
+
+    edition_active: int
+    edition_queued: int
+    edition_delivered: int
+    edition_terminal: int
+    edition_degraded: int
+    delivery_pending: int
+    delivery_sending: int
+    delivery_retry_wait: int
+    delivery_delivered: int
+    delivery_terminal: int
+    latest_delivered_at: str | None
+
+
+@dataclass(frozen=True)
 class RetentionCounts:
     """Candidate row counts from a non-destructive retention preview."""
 
@@ -1959,6 +1976,51 @@ class Database:
                 ).fetchone()[0]
             )
         return BatchHealthCounts(running, interrupted, resumable_items)
+
+    def edition_delivery_health(self) -> EditionDeliveryHealth:
+        """Return local edition/outbox counts without article content or delivery targets."""
+        with self._connection() as connection:
+            editions = connection.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN status IN (
+                        'planned', 'refreshing', 'selecting', 'frozen', 'editorial',
+                        'rendered', 'degraded'
+                    ) THEN 1 ELSE 0 END) AS active,
+                    SUM(CASE WHEN status IN ('queued', 'delivering') THEN 1 ELSE 0 END) AS queued,
+                    SUM(CASE WHEN status = 'delivered' THEN 1 ELSE 0 END) AS delivered,
+                    SUM(CASE WHEN status = 'terminal' THEN 1 ELSE 0 END) AS terminal,
+                    SUM(CASE WHEN degraded_reason_code IS NOT NULL THEN 1 ELSE 0 END) AS degraded
+                FROM edition_runs
+                """
+            ).fetchone()
+            deliveries = connection.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending,
+                    SUM(CASE WHEN status = 'sending' THEN 1 ELSE 0 END) AS sending,
+                    SUM(CASE WHEN status = 'retry_wait' THEN 1 ELSE 0 END) AS retry_wait,
+                    SUM(CASE WHEN status = 'delivered' THEN 1 ELSE 0 END) AS delivered,
+                    SUM(CASE WHEN status = 'terminal' THEN 1 ELSE 0 END) AS terminal,
+                    MAX(delivered_at) AS latest_delivered_at
+                FROM delivery_outbox
+                """
+            ).fetchone()
+        if editions is None or deliveries is None:
+            raise RuntimeError("edition delivery health query returned no row")
+        return EditionDeliveryHealth(
+            edition_active=int(editions["active"] or 0),
+            edition_queued=int(editions["queued"] or 0),
+            edition_delivered=int(editions["delivered"] or 0),
+            edition_terminal=int(editions["terminal"] or 0),
+            edition_degraded=int(editions["degraded"] or 0),
+            delivery_pending=int(deliveries["pending"] or 0),
+            delivery_sending=int(deliveries["sending"] or 0),
+            delivery_retry_wait=int(deliveries["retry_wait"] or 0),
+            delivery_delivered=int(deliveries["delivered"] or 0),
+            delivery_terminal=int(deliveries["terminal"] or 0),
+            latest_delivered_at=deliveries["latest_delivered_at"],
+        )
 
     def processing_error_counts(self, target_language: str) -> list[ProcessingErrorCount]:
         """Aggregate stored failures without exposing provider response bodies."""

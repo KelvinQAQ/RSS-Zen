@@ -128,6 +128,8 @@ def test_loads_equivalent_toml_and_yaml_config(tmp_path: Path, filename: str, co
     assert config.backup.retention_count == 30
     assert config.retention.articles_days is None
     assert config.service.translation_max_attempts == 5
+    assert config.feishu.enabled is False
+    assert config.feishu.budget_mode == "observe"
     assert config.translation.providers[0].api_key == "free-secret"
     ai_provider = config.translation.providers[1]
     assert ai_provider.reasoning_effort == "none"
@@ -262,6 +264,94 @@ def test_rejects_invalid_data_retention(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigurationError, match="articles_days"):
         load_config(config_path)
+
+
+def test_loads_enabled_feishu_settings_and_excludes_resolved_secrets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FEISHU_APP_ID", "cli_123")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "private-secret")
+    config_path = tmp_path / "rss-zen.toml"
+    config_path.write_text(
+        _toml_config()
+        + """
+[feishu]
+enabled = true
+app_id_env = "FEISHU_APP_ID"
+app_secret_env = "FEISHU_APP_SECRET"
+target_ref = "chat:oc_approved"
+batch_size = 5
+max_attempts = 4
+lease_minutes = 3
+max_backoff_minutes = 30
+budget_mode = "observe"
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.feishu.app_id == "cli_123"
+    assert config.feishu.app_secret == "private-secret"
+    assert config.feishu.target_ref == "chat:oc_approved"
+    assert config.feishu.batch_size == 5
+    assert "private-secret" not in repr(config.feishu)
+    assert "app_secret" not in config.feishu.model_dump()
+    assert "app_id" not in config.feishu.model_dump()
+
+
+def test_feishu_rejects_non_official_api_host(tmp_path: Path) -> None:
+    config_path = tmp_path / "rss-zen.toml"
+    config_path.write_text(
+        _toml_config()
+        + """
+[feishu]
+base_url = "https://attacker.example.test"
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigurationError, match="official"):
+        load_config(config_path)
+
+
+def test_enabled_feishu_requires_env_names_and_valid_target(tmp_path: Path) -> None:
+    config_path = tmp_path / "rss-zen.toml"
+    config_path.write_text(
+        _toml_config()
+        + """
+[feishu]
+enabled = true
+target_ref = "not-a-chat"
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigurationError, match="feishu"):
+        load_config(config_path)
+
+
+def test_enabled_feishu_can_load_with_declared_but_unset_secrets(tmp_path: Path) -> None:
+    config_path = tmp_path / "rss-zen.toml"
+    config_path.write_text(
+        _toml_config()
+        + """
+[feishu]
+enabled = true
+app_id_env = "MISSING_FEISHU_APP_ID"
+app_secret_env = "MISSING_FEISHU_APP_SECRET"
+target_ref = "chat:oc_approved"
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path, environment={
+        "FREE_TRANSLATION_API_KEY": "free",
+        "AI_TRANSLATION_API_KEY": "ai",
+    })
+
+    assert config.feishu.app_id is None
+    assert config.feishu.app_secret is None
 
 
 def test_rejects_invalid_backup_retention(tmp_path: Path) -> None:

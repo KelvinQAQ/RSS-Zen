@@ -61,6 +61,56 @@ class BackupSettings(BaseModel):
     retention_count: int = Field(default=30, ge=1)
 
 
+class FeishuSettings(BaseModel):
+    """Inactive-by-default custom-app delivery and bounded worker settings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    base_url: str = "https://open.feishu.cn"
+    app_id_env: str | None = None
+    app_secret_env: str | None = None
+    app_id: str | None = Field(default=None, exclude=True, repr=False)
+    app_secret: str | None = Field(default=None, exclude=True, repr=False)
+    target_ref: str | None = None
+    batch_size: int = Field(default=10, ge=1, le=100)
+    max_attempts: int = Field(default=5, ge=1, le=20)
+    lease_minutes: int = Field(default=5, ge=1, le=60)
+    max_backoff_minutes: int = Field(default=60, ge=1, le=1440)
+    budget_mode: Literal["observe", "warn", "enforce"] = "observe"
+
+    @field_validator("base_url")
+    @classmethod
+    def _https_base_url(cls, value: str) -> str:
+        parsed = urlparse(value)
+        if parsed.scheme != "https" or parsed.hostname != "open.feishu.cn":
+            raise ValueError("Feishu base_url must use the official https://open.feishu.cn host")
+        if parsed.username is not None or parsed.password is not None or parsed.port is not None:
+            raise ValueError("Feishu base_url must not include credentials or a custom port")
+        if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+            raise ValueError("Feishu base_url must be an origin without path, query, or fragment")
+        return "https://open.feishu.cn"
+
+    @model_validator(mode="after")
+    def _enabled_requirements(self) -> FeishuSettings:
+        if not self.enabled:
+            return self
+        for field, value in (
+            ("app_id_env", self.app_id_env),
+            ("app_secret_env", self.app_secret_env),
+        ):
+            if value is None or not _ENVIRONMENT_NAME_RE.fullmatch(value):
+                raise ValueError(f"enabled Feishu delivery requires a valid {field}")
+        if (
+            self.target_ref is None
+            or not self.target_ref.startswith("chat:")
+            or len(self.target_ref) > 255
+            or any(character.isspace() for character in self.target_ref)
+        ):
+            raise ValueError("enabled Feishu delivery requires an opaque chat: target_ref")
+        return self
+
+
 class RetentionSettings(BaseModel):
     """Optional UTC-day retention policy; omitted fields remain disabled."""
 
@@ -437,6 +487,7 @@ class AppConfig(BaseModel):
     retention: RetentionSettings = Field(default_factory=RetentionSettings)
     translation: TranslationSettings
     anysearch: AnySearchSettings = Field(default_factory=AnySearchSettings)
+    feishu: FeishuSettings = Field(default_factory=FeishuSettings)
     feeds: list[FeedConfig] = Field(default_factory=list)
     exports: list[ExportProfile] = Field(default_factory=list)
 

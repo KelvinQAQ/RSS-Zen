@@ -50,6 +50,18 @@ zone = "intl"
 language = "zh-CN"
 max_results = 3
 
+# Keep disabled until the custom app permissions, target chat, and staging send are approved.
+[feishu]
+enabled = false
+app_id_env = "FEISHU_APP_ID"
+app_secret_env = "FEISHU_APP_SECRET"
+# target_ref = "chat:oc_approved"
+batch_size = 10
+max_attempts = 5
+lease_minutes = 5
+max_backoff_minutes = 60
+budget_mode = "observe"
+
 # Add one or more HTTPS feeds after completing provider configuration.
 # [[feeds]]
 # name = "Example feed"

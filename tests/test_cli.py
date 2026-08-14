@@ -150,6 +150,23 @@ api_key_env = "FREE_TRANSLATION_API_KEY"
         "stale": 0,
     }
     assert payload["batches"] == {"running": 0, "interrupted": 0, "resumable_items": 0}
+    assert payload["editions"] == {
+        "active": 0,
+        "queued": 0,
+        "delivered": 0,
+        "terminal": 0,
+        "degraded": 0,
+    }
+    assert payload["delivery"] == {
+        "enabled": False,
+        "budget_mode": "observe",
+        "pending": 0,
+        "sending": 0,
+        "retry_wait": 0,
+        "delivered": 0,
+        "terminal": 0,
+        "latest_delivered_at": None,
+    }
     assert payload["backups"]["newest"] is None
 
 
@@ -600,6 +617,166 @@ api_key_env = "FREE_TRANSLATION_API_KEY"
     assert checks["database"]["status"] == "ok"
     assert "database_storage" in checks
     assert "batches" in checks
+    assert checks["feishu"]["status"] == "ok"
+    assert checks["editions_delivery"]["status"] == "ok"
+
+
+def test_status_and_doctor_report_pending_feishu_delivery_without_target_leak(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("FREE_TRANSLATION_API_KEY", "free-secret")
+    monkeypatch.setenv("FEISHU_APP_ID", "cli_test")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "private-secret")
+    config_path = tmp_path / "rss-zen.toml"
+    config_path.write_text(
+        """
+[database]
+path = "rss-zen.sqlite3"
+
+[translation]
+target_language = "zh-CN"
+
+[[translation.providers]]
+name = "free"
+kind = "libretranslate"
+endpoint = "https://translate.example.test/translate"
+api_key_env = "FREE_TRANSLATION_API_KEY"
+
+[feishu]
+enabled = true
+app_id_env = "FEISHU_APP_ID"
+app_secret_env = "FEISHU_APP_SECRET"
+target_ref = "chat:oc_private_target"
+""",
+        encoding="utf-8",
+    )
+    from pathlib import Path
+
+    from rss_zen.db import Database, TopicProfileInput
+
+    database = Database(tmp_path / "rss-zen.sqlite3")
+    database.initialize()
+    topic = database.create_topic_profile(
+        TopicProfileInput(
+            key="test-topic",
+            version=1,
+            name="Test",
+            timezone="Asia/Shanghai",
+            delivery_deadline="07:30",
+            lookback_hours=24,
+            selection={},
+            safety_limits={"max_candidates": 1, "max_rendered_bytes": 1000},
+        )
+    )
+    edition = database.create_edition_run(
+        topic_profile_id=topic.id,
+        local_date="2026-08-14",
+        deadline_at="2026-08-13T23:30:00+00:00",
+    )
+    database.transition_edition_run(edition.id, status="refreshing")
+    database.transition_edition_run(edition.id, status="selecting")
+    database.freeze_edition_items(edition.id, ())
+    artifact = tmp_path / "edition.md"
+    artifact.write_text("# Empty\n", encoding="utf-8")
+    import hashlib
+
+    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    database.transition_edition_run(
+        edition.id,
+        status="rendered",
+        artifact_path=Path("edition.md"),
+        artifact_sha256=digest,
+    )
+    database.create_delivery_outbox_item(
+        edition_run_id=edition.id,
+        channel="feishu",
+        target_ref="chat:oc_private_target",
+        idempotency_key="test:2026-08-14:feishu",
+        artifact_path=Path("edition.md"),
+        payload_sha256=digest,
+    )
+
+    status_result = runner.invoke(app, ["status", "--json", "--config", str(config_path)])
+    assert status_result.exit_code == 0
+    import json as _json
+
+    status_payload = _json.loads(status_result.stdout)
+    assert status_payload["editions"]["queued"] == 1
+    assert status_payload["delivery"]["enabled"] is True
+    assert status_payload["delivery"]["pending"] == 1
+    assert "oc_private_target" not in status_result.stdout
+    assert "private-secret" not in status_result.stdout
+
+    doctor_result = runner.invoke(app, ["doctor", "--json", "--config", str(config_path)])
+    assert doctor_result.exit_code == 0
+    doctor_payload = _json.loads(doctor_result.stdout)
+    checks = {check["check"]: check for check in doctor_payload["checks"]}
+    assert checks["feishu"]["status"] == "ok"
+    assert checks["editions_delivery"]["status"] == "warning"
+    assert "oc_private_target" not in doctor_result.stdout
+    assert "private-secret" not in doctor_result.stdout
+
+    claimed = database.claim_due_deliveries(
+        worker_id="test-worker",
+        now="2026-08-14T00:00:00+00:00",
+        lease_expires_at="2026-08-14T00:05:00+00:00",
+        limit=1,
+    )
+    database.record_delivery_terminal(
+        claimed[0].id,
+        worker_id="test-worker",
+        error_code="feishu_target_invalid",
+    )
+    terminal_result = runner.invoke(app, ["doctor", "--json", "--config", str(config_path)])
+    assert terminal_result.exit_code == 1
+    terminal_payload = _json.loads(terminal_result.stdout)
+    terminal_checks = {check["check"]: check for check in terminal_payload["checks"]}
+    assert terminal_checks["editions_delivery"]["status"] == "error"
+    assert "oc_private_target" not in terminal_result.stdout
+
+
+def test_doctor_warns_when_enabled_feishu_secret_environment_is_missing(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("FREE_TRANSLATION_API_KEY", "free-secret")
+    monkeypatch.delenv("MISSING_FEISHU_APP_ID", raising=False)
+    monkeypatch.delenv("MISSING_FEISHU_APP_SECRET", raising=False)
+    config_path = tmp_path / "rss-zen.toml"
+    config_path.write_text(
+        """
+[database]
+path = "rss-zen.sqlite3"
+
+[translation]
+target_language = "zh-CN"
+
+[[translation.providers]]
+name = "free"
+kind = "libretranslate"
+endpoint = "https://translate.example.test/translate"
+api_key_env = "FREE_TRANSLATION_API_KEY"
+
+[feishu]
+enabled = true
+app_id_env = "MISSING_FEISHU_APP_ID"
+app_secret_env = "MISSING_FEISHU_APP_SECRET"
+target_ref = "chat:oc_approved"
+""",
+        encoding="utf-8",
+    )
+    from rss_zen.db import Database
+
+    Database(tmp_path / "rss-zen.sqlite3").initialize()
+    result = runner.invoke(app, ["doctor", "--json", "--config", str(config_path)])
+
+    assert result.exit_code == 0
+    import json as _json
+
+    payload = _json.loads(result.stdout)
+    checks = {check["check"]: check for check in payload["checks"]}
+    assert checks["feishu"]["status"] == "warning"
+    assert "MISSING_FEISHU_APP_ID" in checks["feishu"]["detail"]
+    assert "MISSING_FEISHU_APP_SECRET" in checks["feishu"]["detail"]
 
 
 def test_doctor_checks_curl_only_when_configured(tmp_path, monkeypatch) -> None:

@@ -995,6 +995,23 @@ def doctor(
                     "warning",
                     f"env {config.anysearch.api_key_env} is not set; extraction will fail",
                 )
+        if not config.feishu.enabled:
+            _check("feishu", "ok", "delivery is disabled")
+        else:
+            missing = [
+                name
+                for name, value in (
+                    (config.feishu.app_id_env, config.feishu.app_id),
+                    (config.feishu.app_secret_env, config.feishu.app_secret),
+                )
+                if name is not None and not value
+            ]
+            _check(
+                "feishu",
+                "warning" if missing else "ok",
+                "delivery enabled; "
+                + (f"missing env: {', '.join(missing)}" if missing else "credentials are set"),
+            )
 
     # 3. Local configuration metadata and curl prerequisite.
     if config is not None:
@@ -1081,6 +1098,7 @@ def doctor(
             )
             counts = database.processing_counts(config.translation.target_language)
             batch_counts = database.batch_health_counts()
+            delivery_health = database.edition_delivery_health()
             batch_status = (
                 "warning" if batch_counts.interrupted or batch_counts.resumable_items else "ok"
             )
@@ -1098,6 +1116,26 @@ def doctor(
                 f"{counts.pending_translation_count} pending, "
                 f"{counts.failed_translation_count} failed translation, "
                 f"{counts.failed_extraction_count} failed extraction",
+            )
+            delivery_status = (
+                "error"
+                if delivery_health.delivery_terminal
+                else (
+                    "warning"
+                    if delivery_health.delivery_retry_wait
+                    or delivery_health.delivery_pending
+                    or delivery_health.delivery_sending
+                    else "ok"
+                )
+            )
+            _check(
+                "editions_delivery",
+                delivery_status,
+                f"{delivery_health.edition_active} active editions, "
+                f"{delivery_health.edition_queued} queued/delivering, "
+                f"{delivery_health.delivery_pending} pending deliveries, "
+                f"{delivery_health.delivery_retry_wait} retrying, "
+                f"{delivery_health.delivery_terminal} terminal",
             )
         except sqlite3.Error as error:
             _check("repository", "error", f"cannot read repository state: {error}")
@@ -1202,6 +1240,7 @@ def status(
             )
         ]
         batch_counts = database.batch_health_counts()
+        delivery_health = database.edition_delivery_health()
         _json_echo(
             {
                 "schema_version": 1,
@@ -1224,6 +1263,23 @@ def status(
                     "running": batch_counts.running,
                     "interrupted": batch_counts.interrupted,
                     "resumable_items": batch_counts.resumable_items,
+                },
+                "editions": {
+                    "active": delivery_health.edition_active,
+                    "queued": delivery_health.edition_queued,
+                    "delivered": delivery_health.edition_delivered,
+                    "terminal": delivery_health.edition_terminal,
+                    "degraded": delivery_health.edition_degraded,
+                },
+                "delivery": {
+                    "enabled": config.feishu.enabled,
+                    "budget_mode": config.feishu.budget_mode,
+                    "pending": delivery_health.delivery_pending,
+                    "sending": delivery_health.delivery_sending,
+                    "retry_wait": delivery_health.delivery_retry_wait,
+                    "delivered": delivery_health.delivery_delivered,
+                    "terminal": delivery_health.delivery_terminal,
+                    "latest_delivered_at": delivery_health.latest_delivered_at,
                 },
                 "counts": {
                     "articles": counts.article_count,

@@ -12,7 +12,13 @@ import yaml
 from pydantic import ValidationError
 
 from rss_zen.errors import ConfigurationError
-from rss_zen.models import AnySearchSettings, AppConfig, FeedConfig, TranslationSettings
+from rss_zen.models import (
+    AnySearchSettings,
+    AppConfig,
+    FeedConfig,
+    FeishuSettings,
+    TranslationSettings,
+)
 
 
 def load_config(path: Path, *, environment: Mapping[str, str] | None = None) -> AppConfig:
@@ -56,8 +62,14 @@ def _resolve_secrets(config: AppConfig, environment: Mapping[str, str]) -> AppCo
     )
     feeds = [_resolve_feed_headers(feed, environment) for feed in config.feeds]
     anysearch = _resolve_anysearch_secret(config.anysearch, environment)
+    feishu = _resolve_feishu_secrets(config.feishu, environment)
     return config.model_copy(
-        update={"translation": translation, "feeds": feeds, "anysearch": anysearch}
+        update={
+            "translation": translation,
+            "feeds": feeds,
+            "anysearch": anysearch,
+            "feishu": feishu,
+        }
     )
 
 
@@ -91,6 +103,20 @@ def _resolve_anysearch_secret(
     if settings.api_key_env is None:
         return settings
     return settings.model_copy(update={"api_key": environment.get(settings.api_key_env)})
+
+
+def _resolve_feishu_secrets(
+    settings: FeishuSettings, environment: Mapping[str, str]
+) -> FeishuSettings:
+    """Resolve optional delivery credentials so doctor can report missing values locally."""
+    if not settings.enabled:
+        return settings
+    return settings.model_copy(
+        update={
+            "app_id": environment.get(settings.app_id_env or ""),
+            "app_secret": environment.get(settings.app_secret_env or ""),
+        }
+    )
 
 
 def _format_validation_error(error: ValidationError) -> str:
