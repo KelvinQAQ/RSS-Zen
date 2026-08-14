@@ -31,7 +31,7 @@ class FeedControlService:
     def __init__(
         self,
         database: Database,
-        http: FeedHttpClient,
+        http: FeedHttpClient | None = None,
         *,
         policy: FeedUrlPolicy | None = None,
         now=lambda: datetime.now(UTC),
@@ -48,6 +48,8 @@ class FeedControlService:
                 "feed_confirmation_required",
                 "public Agent feed probe does not accept URL query parameters",
             )
+        if self._http is None:
+            raise RuntimeError("feed probe requires an HTTP client")
         response = self._http.get_feed(normalized, {})
         try:
             parsed = feedparser.parse(response.content)

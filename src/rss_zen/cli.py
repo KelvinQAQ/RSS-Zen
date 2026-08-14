@@ -336,7 +336,7 @@ def feed_add(
     """Add an already-probed public feed and append mutation audit."""
     try:
         database, _ = _database_from_config(config_path)
-        feed = FeedControlService(database, FeedHttpClient(httpx.Client())).add(
+        feed = FeedControlService(database).add(
             token=token, url=url, name=name, categories=tuple(category or ()), actor=actor
         )
         _json_echo(
@@ -374,6 +374,16 @@ def feed_list(config_path: Path = typer.Option(Path("rss-zen.toml"), "--config",
     )
 
 
+@app.command("audit-list")
+def audit_list(
+    limit: int = typer.Option(100, "--limit", min=1, max=1000),
+    config_path: Path = typer.Option(Path("rss-zen.toml"), "--config", "-c"),
+) -> None:
+    """List bounded mutation audit events without sensitive content."""
+    database, _ = _database_from_config(config_path)
+    _json_echo({"schema_version": 1, "events": database.list_mutation_audit(limit=limit)})
+
+
 @app.command("feed-disable")
 def feed_disable(
     feed_id: int = typer.Option(..., "--feed-id", min=1),
@@ -383,9 +393,7 @@ def feed_disable(
     """Disable a feed without deleting history and append mutation audit."""
     try:
         database, _ = _database_from_config(config_path)
-        feed = FeedControlService(database, FeedHttpClient(httpx.Client())).disable(
-            feed_id, actor=actor
-        )
+        feed = FeedControlService(database).disable(feed_id, actor=actor)
         _json_echo(
             {
                 "schema_version": 1,

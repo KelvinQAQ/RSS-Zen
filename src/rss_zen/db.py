@@ -1502,6 +1502,28 @@ class Database:
             )
         return int(cursor.lastrowid)
 
+    def list_mutation_audit(self, *, limit: int = 100) -> list[Mapping[str, object]]:
+        """Return bounded identifier-only audit events newest first."""
+        if limit < 1 or limit > 1000:
+            raise ValueError("audit limit must be between 1 and 1000")
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM mutation_audit ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [
+            {
+                "id": int(row["id"]),
+                "actor": str(row["actor"]),
+                "operation": str(row["operation"]),
+                "target_type": str(row["target_type"]),
+                "target_id": str(row["target_id"]),
+                "outcome": str(row["outcome"]),
+                "metadata": json.loads(str(row["metadata_json"])),
+                "created_at": str(row["created_at"]),
+            }
+            for row in rows
+        ]
+
     def get_feed_by_url(self, url: str) -> FeedRecord | None:
         """Look up a feed by URL."""
         with self._connection() as connection:
