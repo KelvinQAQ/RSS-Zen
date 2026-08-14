@@ -47,6 +47,9 @@ See the [v0.2.0 scope and exit criteria](releases/v0.2.0.md) and the post-releas
 
 ## v0.3.0 — Agent-operated Feishu daily digest
 
+**Status:** released from the v0.3.0 tag; production Feishu/editorial activation remains an explicit
+operator-controlled deployment gate.
+
 **Goal:** reliably deliver topic-oriented Chinese news editions to a Feishu custom app bot before
 an explicit `Asia/Shanghai` deadline, while keeping Pi Agent outside deterministic scheduling,
 retry, credential, and delivery boundaries.

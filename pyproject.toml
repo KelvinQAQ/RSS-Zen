@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "rss-zen"
-version = "0.2.0"
+version = "0.3.0"
 description = "Local multilingual RSS-to-Markdown workflow"
 license = "MIT"
 readme = "README.md"
