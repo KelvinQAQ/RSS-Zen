@@ -257,6 +257,10 @@ def test_delivery_worker_persists_retry_success_terminal_and_does_not_resend(
     assert database.get_edition_run(edition.id).status == "delivered"
     assert worker.run_once(now="2026-08-14T01:00:00+00:00").claimed == 0
     assert adapter.calls == 2
+    usage = database.usage_totals(
+        local_date="2026-08-14", category="delivery", provider="feishu"
+    )
+    assert usage.attempts == 2
 
     database2, edition2, delivery2 = _pending_delivery(tmp_path / "terminal")
 

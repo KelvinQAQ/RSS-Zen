@@ -3,11 +3,17 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import httpx
 import pytest
 
 from rss_zen.db import ArticleInput, Database, FeedInput
 from rss_zen.errors import AppError
-from rss_zen.translation import TranslationProviderError, TranslationService
+from rss_zen.models import TranslationProviderConfig, TranslationSettings
+from rss_zen.translation import (
+    TranslationProviderError,
+    TranslationService,
+    build_translation_service,
+)
 
 
 @dataclass
@@ -56,6 +62,45 @@ def _article(database: Database):
             published_at=None,
         ),
     ).article
+
+
+def test_persistent_daily_budget_stops_background_provider_calls_and_retries_later(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "rss-zen.sqlite3")
+    database.initialize()
+    article = _article(database)
+    calls = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"translatedText": "中文"})
+
+    settings = TranslationSettings(
+        providers=[
+            TranslationProviderConfig(
+                name="free",
+                kind="libretranslate",
+                endpoint="https://translate.example.test/translate",
+            )
+        ]
+    )
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        service = build_translation_service(
+            database,
+            settings,
+            client,
+            persistent_daily_limits=(1, 1000),
+        )
+        result = service.translate_article(article, source_language_override="en")
+
+    stored = database.latest_translation(article.id, "zh-CN")
+    assert calls == 1
+    assert result.error_code == "provider_daily_budget_exhausted"
+    assert stored is not None
+    assert stored.terminal is False
+    assert stored.next_retry_at is not None
 
 
 def test_falls_back_to_ai_provider_and_persists_translation(tmp_path: Path) -> None:

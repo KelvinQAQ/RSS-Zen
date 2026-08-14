@@ -139,7 +139,7 @@ api_key_env = "FREE_TRANSLATION_API_KEY"
     payload = _json.loads(result.stdout)
     assert payload["schema_version"] == 1
     assert payload["generated_at"]
-    assert payload["database"]["schema_version"] == 6
+    assert payload["database"]["schema_version"] == 7
     assert payload["database"]["size_bytes"] > 0
     assert payload["database"]["wal_size_bytes"] >= 0
     assert payload["disk"]["free_bytes"] > 0
@@ -167,6 +167,17 @@ api_key_env = "FREE_TRANSLATION_API_KEY"
         "terminal": 0,
         "latest_delivered_at": None,
     }
+    assert payload["usage"]["timezone"] == "Asia/Shanghai"
+    assert payload["usage"]["daily"] == {
+        "requests": 0,
+        "source_chars": 0,
+        "response_bytes": 0,
+        "attempts": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cost_microunits": 0,
+    }
+    assert payload["usage"]["monthly"] == payload["usage"]["daily"]
     assert payload["backups"]["newest"] is None
 
 

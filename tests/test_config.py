@@ -123,6 +123,8 @@ def test_loads_equivalent_toml_and_yaml_config(tmp_path: Path, filename: str, co
     assert config.limits.max_source_chars_per_run == 500_000
     assert config.limits.max_extract_articles_per_run == 20
     assert config.limits.max_translate_articles_per_run == 50
+    assert config.limits.max_background_provider_requests_per_day == 200
+    assert config.limits.max_background_source_chars_per_day == 500_000
     assert config.backup.directory == Path("backups")
     assert config.backup.retention_days == 30
     assert config.backup.retention_count == 30

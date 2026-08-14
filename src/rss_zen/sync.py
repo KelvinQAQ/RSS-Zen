@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from urllib.parse import SplitResult, urljoin, urlsplit, urlunsplit
+from zoneinfo import ZoneInfo
 
 import feedparser
 
@@ -77,6 +78,16 @@ class FeedSyncService:
         else:
             response = self._http_client.get_feed(feed.url, headers)
         try:
+            self._database.record_usage(
+                local_date=datetime.now(UTC)
+                .astimezone(ZoneInfo("Asia/Shanghai"))
+                .date()
+                .isoformat(),
+                category="feed",
+                provider=urlsplit(feed.url).hostname or "unknown",
+                response_bytes=len(response.content),
+                attempts=1,
+            )
             if response.status_code == 304:
                 self._database.record_feed_success(feed.id, etag=None, last_modified=None)
                 return FeedSyncResult(feed_id=feed.id, not_modified=True)

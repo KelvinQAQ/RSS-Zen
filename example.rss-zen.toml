@@ -17,6 +17,9 @@ max_provider_requests_per_run = 200
 max_source_chars_per_run = 500000
 max_extract_articles_per_run = 20
 max_translate_articles_per_run = 50
+# Mandatory background-service safety ceilings, tuned later from observed usage.
+max_background_provider_requests_per_day = 200
+max_background_source_chars_per_day = 500000
 
 [backup]
 # Relative paths are resolved beside this config file.

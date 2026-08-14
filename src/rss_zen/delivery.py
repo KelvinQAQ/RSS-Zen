@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
+from zoneinfo import ZoneInfo
 
 from rss_zen.db import Database, DeliveryOutboxRecord
 from rss_zen.errors import AppError
@@ -73,7 +74,14 @@ class DeliveryWorker:
         delivered = 0
         retried = 0
         terminal = 0
+        local_date = started_at.astimezone(ZoneInfo("Asia/Shanghai")).date().isoformat()
         for delivery in deliveries:
+            self._database.record_usage(
+                local_date=local_date,
+                category="delivery",
+                provider=delivery.channel,
+                attempts=1,
+            )
             try:
                 receipt = self._adapter.deliver(delivery)
             except AppError as error:

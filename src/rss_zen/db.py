@@ -263,6 +263,19 @@ class EditionDeliveryHealth:
 
 
 @dataclass(frozen=True)
+class UsageTotals:
+    """Aggregate provider usage without content or credentials."""
+
+    requests: int = 0
+    source_chars: int = 0
+    response_bytes: int = 0
+    attempts: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_microunits: int = 0
+
+
+@dataclass(frozen=True)
 class RetentionCounts:
     """Candidate row counts from a non-destructive retention preview."""
 
@@ -581,6 +594,24 @@ CREATE INDEX idx_edition_run_items_order
 ON edition_run_items(edition_run_id, position);
 """
 
+_MIGRATION_7 = """
+CREATE TABLE usage_daily (
+    local_date TEXT NOT NULL,
+    category TEXT NOT NULL CHECK(category IN ('feed', 'translation', 'pi', 'delivery')),
+    provider TEXT NOT NULL,
+    requests INTEGER NOT NULL DEFAULT 0 CHECK(requests >= 0),
+    source_chars INTEGER NOT NULL DEFAULT 0 CHECK(source_chars >= 0),
+    response_bytes INTEGER NOT NULL DEFAULT 0 CHECK(response_bytes >= 0),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+    input_tokens INTEGER NOT NULL DEFAULT 0 CHECK(input_tokens >= 0),
+    output_tokens INTEGER NOT NULL DEFAULT 0 CHECK(output_tokens >= 0),
+    cost_microunits INTEGER NOT NULL DEFAULT 0 CHECK(cost_microunits >= 0),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(local_date, category, provider)
+);
+CREATE INDEX idx_usage_daily_category_date ON usage_daily(category, local_date);
+"""
+
 _MIGRATIONS: tuple[tuple[int, str], ...] = (
     (1, _MIGRATION_1),
     (2, _MIGRATION_2),
@@ -588,6 +619,7 @@ _MIGRATIONS: tuple[tuple[int, str], ...] = (
     (4, _MIGRATION_4),
     (5, _MIGRATION_5),
     (6, _MIGRATION_6),
+    (7, _MIGRATION_7),
 )
 _PRE_MIGRATION_BACKUP_RETENTION_COUNT = 10
 
@@ -1977,6 +2009,124 @@ class Database:
             )
         return BatchHealthCounts(running, interrupted, resumable_items)
 
+    def reserve_usage(
+        self,
+        *,
+        local_date: str,
+        category: str,
+        provider: str,
+        requests: int = 0,
+        source_chars: int = 0,
+        max_requests: int | None = None,
+        max_source_chars: int | None = None,
+    ) -> UsageTotals:
+        """Atomically reserve bounded provider usage across processes and restarts."""
+        _validate_usage_dimensions(local_date, category, provider)
+        if requests < 0 or source_chars < 0 or requests + source_chars < 1:
+            raise ValueError("usage reservation must be nonnegative and non-empty")
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM usage_daily WHERE local_date=? AND category=? AND provider=?",
+                (local_date, category, provider),
+            ).fetchone()
+            current_requests = int(row["requests"]) if row else 0
+            current_chars = int(row["source_chars"]) if row else 0
+            if max_requests is not None and current_requests + requests > max_requests:
+                raise ValueError("daily provider request budget is exhausted")
+            if max_source_chars is not None and current_chars + source_chars > max_source_chars:
+                raise ValueError("daily provider source-character budget is exhausted")
+            connection.execute(
+                """
+                INSERT INTO usage_daily(
+                    local_date, category, provider, requests, source_chars, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(local_date, category, provider) DO UPDATE SET
+                    requests=requests+excluded.requests,
+                    source_chars=source_chars+excluded.source_chars,
+                    updated_at=excluded.updated_at
+                """,
+                (local_date, category, provider, requests, source_chars, _utc_now()),
+            )
+        return self.usage_totals(local_date=local_date, category=category, provider=provider)
+
+    def record_usage(
+        self,
+        *,
+        local_date: str,
+        category: str,
+        provider: str,
+        response_bytes: int = 0,
+        attempts: int = 0,
+    ) -> UsageTotals:
+        """Add non-budget usage counters after local or external work."""
+        _validate_usage_dimensions(local_date, category, provider)
+        if response_bytes < 0 or attempts < 0 or response_bytes + attempts < 1:
+            raise ValueError("usage counters must be nonnegative and non-empty")
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO usage_daily(
+                    local_date, category, provider, response_bytes, attempts, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(local_date, category, provider) DO UPDATE SET
+                    response_bytes=response_bytes+excluded.response_bytes,
+                    attempts=attempts+excluded.attempts,
+                    updated_at=excluded.updated_at
+                """,
+                (local_date, category, provider, response_bytes, attempts, _utc_now()),
+            )
+        return self.usage_totals(local_date=local_date, category=category, provider=provider)
+
+    def usage_totals(
+        self, *, local_date: str, category: str | None = None, provider: str | None = None
+    ) -> UsageTotals:
+        """Aggregate one local reporting day with optional category/provider filters."""
+        _validate_date(local_date, field="local_date")
+        clauses = ["local_date = ?"]
+        values: list[object] = [local_date]
+        if category is not None:
+            _validate_usage_dimensions(local_date, category, provider or "all")
+            clauses.append("category = ?")
+            values.append(category)
+        if provider is not None:
+            clauses.append("provider = ?")
+            values.append(provider)
+        with self._connection() as connection:
+            row = connection.execute(
+                f"""
+                SELECT COALESCE(SUM(requests),0) requests,
+                       COALESCE(SUM(source_chars),0) source_chars,
+                       COALESCE(SUM(response_bytes),0) response_bytes,
+                       COALESCE(SUM(attempts),0) attempts,
+                       COALESCE(SUM(input_tokens),0) input_tokens,
+                       COALESCE(SUM(output_tokens),0) output_tokens,
+                       COALESCE(SUM(cost_microunits),0) cost_microunits
+                FROM usage_daily WHERE {' AND '.join(clauses)}
+                """,
+                values,
+            ).fetchone()
+        return UsageTotals(*(int(value) for value in row))
+
+    def usage_totals_period(self, *, start_date: str, end_date: str) -> UsageTotals:
+        """Aggregate usage over a half-open local-date range."""
+        start = _validate_date(start_date, field="start_date")
+        end = _validate_date(end_date, field="end_date")
+        if end <= start:
+            raise ValueError("usage period end_date must be after start_date")
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT COALESCE(SUM(requests),0), COALESCE(SUM(source_chars),0),
+                       COALESCE(SUM(response_bytes),0), COALESCE(SUM(attempts),0),
+                       COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+                       COALESCE(SUM(cost_microunits),0)
+                FROM usage_daily WHERE local_date >= ? AND local_date < ?
+                """,
+                (start.isoformat(), end.isoformat()),
+            ).fetchone()
+        return UsageTotals(*(int(value) for value in row))
+
     def edition_delivery_health(self) -> EditionDeliveryHealth:
         """Return local edition/outbox counts without article content or delivery targets."""
         with self._connection() as connection:
@@ -2456,6 +2606,14 @@ def _article_hash(item: ArticleInput) -> str:
 
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _validate_usage_dimensions(local_date: str, category: str, provider: str) -> None:
+    _validate_date(local_date, field="local_date")
+    if category not in {"feed", "translation", "pi", "delivery"}:
+        raise ValueError("invalid usage category")
+    if not provider or len(provider) > 128 or any(character.isspace() for character in provider):
+        raise ValueError("usage provider must be a bounded opaque identifier")
 
 
 def _validate_topic_profile(item: TopicProfileInput) -> None:

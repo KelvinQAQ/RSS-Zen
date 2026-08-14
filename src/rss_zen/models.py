@@ -49,6 +49,8 @@ class LimitsSettings(BaseModel):
     max_source_chars_per_run: int = Field(default=500_000, ge=1)
     max_extract_articles_per_run: int = Field(default=20, ge=1)
     max_translate_articles_per_run: int = Field(default=50, ge=1)
+    max_background_provider_requests_per_day: int = Field(default=200, ge=1)
+    max_background_source_chars_per_day: int = Field(default=500_000, ge=1)
 
 
 class BackupSettings(BaseModel):

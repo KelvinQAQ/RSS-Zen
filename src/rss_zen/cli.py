@@ -259,6 +259,10 @@ def serve(
                     max_attempts=config.service.translation_max_attempts,
                     max_backoff_minutes=config.service.retry_max_backoff_minutes,
                     max_translation_chars=config.limits.max_translation_chars,
+                    persistent_daily_limits=(
+                        config.limits.max_background_provider_requests_per_day,
+                        config.limits.max_background_source_chars_per_day,
+                    ),
                 )
                 sync_service = FeedSyncService(
                     database,
@@ -1498,6 +1502,13 @@ def status(
         ]
         batch_counts = database.batch_health_counts()
         delivery_health = database.edition_delivery_health()
+        reporting_date = health_now.astimezone(ZoneInfo("Asia/Shanghai")).date()
+        month_start = reporting_date.replace(day=1)
+        next_month = (month_start + timedelta(days=32)).replace(day=1)
+        daily_usage = database.usage_totals(local_date=reporting_date.isoformat())
+        monthly_usage = database.usage_totals_period(
+            start_date=month_start.isoformat(), end_date=next_month.isoformat()
+        )
         _json_echo(
             {
                 "schema_version": 1,
@@ -1537,6 +1548,28 @@ def status(
                     "delivered": delivery_health.delivery_delivered,
                     "terminal": delivery_health.delivery_terminal,
                     "latest_delivered_at": delivery_health.latest_delivered_at,
+                },
+                "usage": {
+                    "timezone": "Asia/Shanghai",
+                    "local_date": reporting_date.isoformat(),
+                    "daily": {
+                        "requests": daily_usage.requests,
+                        "source_chars": daily_usage.source_chars,
+                        "response_bytes": daily_usage.response_bytes,
+                        "attempts": daily_usage.attempts,
+                        "input_tokens": daily_usage.input_tokens,
+                        "output_tokens": daily_usage.output_tokens,
+                        "cost_microunits": daily_usage.cost_microunits,
+                    },
+                    "monthly": {
+                        "requests": monthly_usage.requests,
+                        "source_chars": monthly_usage.source_chars,
+                        "response_bytes": monthly_usage.response_bytes,
+                        "attempts": monthly_usage.attempts,
+                        "input_tokens": monthly_usage.input_tokens,
+                        "output_tokens": monthly_usage.output_tokens,
+                        "cost_microunits": monthly_usage.cost_microunits,
+                    },
                 },
                 "counts": {
                     "articles": counts.article_count,

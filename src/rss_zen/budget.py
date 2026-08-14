@@ -2,9 +2,59 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
 
+from rss_zen.db import Database
 from rss_zen.errors import AppError
+
+
+@dataclass
+class PersistentProviderBudget:
+    """Reserve daily provider usage transactionally across service processes and restarts."""
+
+    def __init__(
+        self,
+        database: Database,
+        *,
+        provider: str,
+        max_requests: int,
+        max_source_chars: int,
+        timezone: str = "Asia/Shanghai",
+        now: Callable[[], datetime] | None = None,
+    ) -> None:
+        if max_requests < 1 or max_source_chars < 1:
+            raise ValueError("persistent provider limits must be positive")
+        self._database = database
+        self._provider = provider
+        self._max_requests = max_requests
+        self._max_source_chars = max_source_chars
+        self._timezone = ZoneInfo(timezone)
+        self._now = now or (lambda: datetime.now(UTC))
+
+    def reserve(self, *, source_chars: int, requests: int = 1) -> None:
+        """Reserve one outbound call before crossing the provider boundary."""
+        try:
+            self._database.reserve_usage(
+                local_date=self._now().astimezone(self._timezone).date().isoformat(),
+                category="translation",
+                provider=self._provider,
+                requests=requests,
+                source_chars=source_chars,
+                max_requests=self._max_requests,
+                max_source_chars=self._max_source_chars,
+            )
+        except ValueError as error:
+            if "budget is exhausted" not in str(error):
+                raise
+            raise AppError(
+                "provider_daily_budget_exhausted",
+                "daily translation provider budget is exhausted",
+                retryable=True,
+                cause=error,
+            ) from error
 
 
 @dataclass

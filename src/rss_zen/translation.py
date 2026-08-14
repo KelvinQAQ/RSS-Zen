@@ -11,7 +11,7 @@ from typing import Protocol
 import httpx
 from langdetect import DetectorFactory, LangDetectException, detect
 
-from rss_zen.budget import RunBudget
+from rss_zen.budget import PersistentProviderBudget, RunBudget
 from rss_zen.db import ArticleRecord, Database, TranslationInput
 from rss_zen.errors import AppError
 from rss_zen.models import TranslationProviderConfig, TranslationSettings
@@ -341,6 +341,13 @@ class TranslationService:
             except TranslationProviderError as error:
                 last_error = error
                 continue
+            except AppError as error:
+                if error.code != "provider_daily_budget_exhausted":
+                    raise
+                last_error = TranslationProviderError(
+                    error.code, error.message, retryable=True
+                )
+                break
             self._database.save_translation(
                 TranslationInput(
                     article_id=article.id,
@@ -428,16 +435,25 @@ def build_translation_service(
     max_backoff_minutes: int = 360,
     max_translation_chars: int = 100_000,
     budget: RunBudget | None = None,
+    persistent_daily_limits: tuple[int, int] | None = None,
 ) -> TranslationService:
     """Build configured adapters in declared priority order."""
     providers: list[TranslationProvider] = []
     for provider in settings.providers:
+        provider_budget = budget
+        if provider_budget is None and persistent_daily_limits is not None:
+            provider_budget = PersistentProviderBudget(
+                database,
+                provider=provider.name,
+                max_requests=persistent_daily_limits[0],
+                max_source_chars=persistent_daily_limits[1],
+            )
         if provider.kind == "libretranslate":
-            providers.append(LibreTranslateProvider(provider, client, budget=budget))
+            providers.append(LibreTranslateProvider(provider, client, budget=provider_budget))
         elif provider.kind == "mymemory":
-            providers.append(MyMemoryProvider(provider, client, budget=budget))
+            providers.append(MyMemoryProvider(provider, client, budget=provider_budget))
         else:
-            providers.append(OpenAICompatibleProvider(provider, client, budget=budget))
+            providers.append(OpenAICompatibleProvider(provider, client, budget=provider_budget))
     return TranslationService(
         database,
         providers,

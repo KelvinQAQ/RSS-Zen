@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -49,6 +51,12 @@ def test_sync_uses_conditional_headers_and_handles_not_modified(tmp_path: Path) 
     assert second.not_modified is True
     assert requests[1].headers["if-none-match"] == '"v1"'
     assert requests[1].headers["if-modified-since"] == "Mon, 11 Aug 2026 10:00:00 GMT"
+    local_date = datetime.now(UTC).astimezone(ZoneInfo("Asia/Shanghai")).date().isoformat()
+    usage = database.usage_totals(
+        local_date=local_date, category="feed", provider="example.test"
+    )
+    assert usage.attempts == 2
+    assert usage.response_bytes == len(_fixture("sample.rss.xml"))
 
 
 def test_sync_sends_per_feed_custom_headers(tmp_path: Path) -> None:
