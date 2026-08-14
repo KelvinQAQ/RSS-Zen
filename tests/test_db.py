@@ -467,6 +467,12 @@ def test_delivery_expired_lease_is_recovered_and_can_be_terminal(database: Datab
     assert terminal.status == "terminal"
     assert terminal.error_code == "feishu_target_invalid"
     assert database.get_edition_run(edition.id).status == "terminal"
+    redelivered = database.redeliver_terminal(edition.id)
+    assert redelivered.status == "pending"
+    assert redelivered.payload_sha256 == delivery.payload_sha256
+    assert database.get_edition_run(edition.id).status == "queued"
+    with pytest.raises(ValueError, match="only terminal"):
+        database.redeliver_terminal(edition.id)
 
 
 def test_schema_7_backup_restore_preserves_pending_delivery(tmp_path: Path) -> None:

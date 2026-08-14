@@ -19,7 +19,7 @@ from rss_zen.budget import RunBudget
 from rss_zen.config import load_config
 from rss_zen.control import FeedControlService
 from rss_zen.coordinator import DeadlineCoordinator
-from rss_zen.db import Database
+from rss_zen.db import Database, TopicProfileInput
 from rss_zen.delivery import DeliveryWorker
 from rss_zen.edition import EditionBuilder
 from rss_zen.editorial import EditorialService, PiEditorialRunner
@@ -1068,6 +1068,154 @@ def export_articles(
         f"export_run_id={result.export_run_id}"
     )
     typer.echo(message)
+
+
+@app.command("topic-list")
+def topic_list(config_path: Path = typer.Option(Path("rss-zen.toml"), "--config", "-c")) -> None:
+    """List latest topic versions without editorial content."""
+    database, _ = _database_from_config(config_path)
+    _json_echo(
+        {
+            "schema_version": 1,
+            "topics": [
+                {
+                    "key": item.key,
+                    "version": item.version,
+                    "name": item.name,
+                    "timezone": item.timezone,
+                    "delivery_deadline": item.delivery_deadline,
+                    "lookback_hours": item.lookback_hours,
+                    "enabled": item.enabled,
+                }
+                for item in database.list_latest_topic_profiles()
+            ],
+        }
+    )
+
+
+@app.command("topic-apply")
+def topic_apply(
+    key: str = typer.Option(..., "--key"),
+    version: int = typer.Option(..., "--version", min=1),
+    name: str = typer.Option(..., "--name"),
+    keyword: list[str] = typer.Option(..., "--keyword"),
+    deadline: str = typer.Option("07:30", "--deadline"),
+    lookback_hours: int = typer.Option(24, "--lookback-hours", min=1, max=744),
+    preparation_minutes: int = typer.Option(60, "--preparation-minutes", min=1, max=1440),
+    max_candidates: int = typer.Option(100, "--max-candidates", min=1, max=1000),
+    actor: str = typer.Option("pi-agent", "--actor"),
+    config_path: Path = typer.Option(Path("rss-zen.toml"), "--config", "-c"),
+) -> None:
+    """Apply one explicit immutable topic version with bounded selection fields."""
+    try:
+        database, _ = _database_from_config(config_path)
+        item = database.create_topic_profile(
+            TopicProfileInput(
+                key=key,
+                version=version,
+                name=name,
+                timezone="Asia/Shanghai",
+                delivery_deadline=deadline,
+                lookback_hours=lookback_hours,
+                selection={
+                    "keywords": keyword,
+                    "content_keywords": [],
+                    "keyword_match": "any",
+                    "sources": [],
+                    "categories": [],
+                    "feed_priority": [],
+                    "dedupe_by_title": True,
+                    "include_untranslated": True,
+                },
+                safety_limits={
+                    "max_candidates": max_candidates,
+                    "max_rendered_bytes": 1_000_000,
+                    "preparation_minutes": preparation_minutes,
+                },
+            )
+        )
+        audit_id = database.record_mutation_audit(
+            actor=actor,
+            operation="topic.apply",
+            target_type="topic",
+            target_id=item.key,
+            outcome="succeeded",
+            metadata={"version": version, "keyword_count": len(keyword)},
+        )
+        _json_echo(
+            {
+                "schema_version": 1,
+                "operation": "topic.apply",
+                "key": item.key,
+                "version": item.version,
+                "audit_id": audit_id,
+            }
+        )
+    except (AppError, ValueError) as error:
+        _handle_app_error(
+            error
+            if isinstance(error, AppError)
+            else AppError("topic_invalid", "topic definition is invalid", cause=error)
+        )
+
+
+@app.command("edition-list")
+def edition_list(
+    limit: int = typer.Option(100, "--limit", min=1, max=1000),
+    config_path: Path = typer.Option(Path("rss-zen.toml"), "--config", "-c"),
+) -> None:
+    """List edition operational state without content or delivery targets."""
+    database, _ = _database_from_config(config_path)
+    _json_echo(
+        {
+            "schema_version": 1,
+            "editions": [
+                {
+                    "id": item.id,
+                    "topic_profile_id": item.topic_profile_id,
+                    "local_date": item.local_date,
+                    "deadline_at": item.deadline_at,
+                    "status": item.status,
+                    "candidate_count": item.candidate_count,
+                    "degraded_reason_code": item.degraded_reason_code,
+                }
+                for item in database.list_edition_runs(limit=limit)
+            ],
+        }
+    )
+
+
+@app.command("edition-redeliver")
+def edition_redeliver(
+    edition_id: int = typer.Option(..., "--edition-id", min=1),
+    actor: str = typer.Option("pi-agent", "--actor"),
+    config_path: Path = typer.Option(Path("rss-zen.toml"), "--config", "-c"),
+) -> None:
+    """Requeue one terminal edition without changing its artifact."""
+    try:
+        database, _ = _database_from_config(config_path)
+        delivery = database.redeliver_terminal(edition_id)
+        audit_id = database.record_mutation_audit(
+            actor=actor,
+            operation="edition.redeliver",
+            target_type="edition",
+            target_id=str(edition_id),
+            outcome="succeeded",
+            metadata={"delivery_id": delivery.id},
+        )
+        _json_echo(
+            {
+                "schema_version": 1,
+                "operation": "edition.redeliver",
+                "edition_id": edition_id,
+                "delivery_status": delivery.status,
+                "audit_id": audit_id,
+            }
+        )
+    except (KeyError, ValueError) as error:
+        _handle_app_error(
+            AppError("edition_redeliver_invalid", "edition cannot be redelivered", cause=error)
+        )
 
 
 @app.command("edition-build")

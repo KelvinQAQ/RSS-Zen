@@ -805,6 +805,16 @@ class Database:
             raise ValueError("a different topic profile already uses this key and version")
         return record
 
+    def list_latest_topic_profiles(self) -> list[TopicProfileRecord]:
+        """Return one latest immutable version per topic key."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                """SELECT topic_profiles.* FROM topic_profiles JOIN (
+                SELECT key, MAX(version) version FROM topic_profiles GROUP BY key
+                ) latest USING(key, version) ORDER BY key"""
+            ).fetchall()
+        return [_topic_profile_from_row(row) for row in rows]
+
     def latest_topic_profile(self, key: str) -> TopicProfileRecord | None:
         """Return the newest immutable version of one topic key."""
         with self._connection() as connection:
@@ -845,6 +855,16 @@ class Database:
         if record.deadline_at != deadline_at:
             raise ValueError("edition already exists with a different deadline")
         return record
+
+    def list_edition_runs(self, *, limit: int = 100) -> list[EditionRunRecord]:
+        """Return bounded edition operational metadata newest first."""
+        if limit < 1 or limit > 1000:
+            raise ValueError("edition limit must be between 1 and 1000")
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM edition_runs ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [_edition_run_from_row(row) for row in rows]
 
     def get_edition_run(self, run_id: int) -> EditionRunRecord:
         """Return one edition run or raise KeyError."""
@@ -1191,6 +1211,41 @@ class Database:
             ).fetchone()
         return _delivery_outbox_from_row(row) if row is not None else None
 
+    def redeliver_terminal(self, edition_run_id: int) -> DeliveryOutboxRecord:
+        """Reset only terminal delivery with unchanged artifact metadata."""
+        now = _utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            edition = connection.execute(
+                "SELECT * FROM edition_runs WHERE id=?", (edition_run_id,)
+            ).fetchone()
+            delivery = connection.execute(
+                "SELECT * FROM delivery_outbox WHERE edition_run_id=?", (edition_run_id,)
+            ).fetchone()
+            if edition is None or delivery is None:
+                raise KeyError(edition_run_id)
+            if edition["status"] != "terminal" or delivery["status"] != "terminal":
+                raise ValueError("only terminal delivery can be redelivered")
+            if edition["artifact_sha256"] != delivery["payload_sha256"]:
+                raise ValueError("terminal delivery artifact hash does not match")
+            connection.execute(
+                """UPDATE delivery_outbox SET status='pending', error_code=NULL,
+                next_attempt_at=NULL, lease_owner=NULL, lease_expires_at=NULL, updated_at=?
+                WHERE id=?""",
+                (now, int(delivery["id"])),
+            )
+            connection.execute(
+                """
+                UPDATE edition_runs
+                SET status='queued', completed_at=NULL, updated_at=? WHERE id=?
+                """,
+                (now, edition_run_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM delivery_outbox WHERE id=?", (int(delivery["id"]),)
+            ).fetchone()
+        return _delivery_outbox_from_row(row)
+
     def get_delivery_outbox_item(self, item_id: int) -> DeliveryOutboxRecord:
         """Return one durable delivery item or raise KeyError."""
         with self._connection() as connection:
@@ -1492,6 +1547,15 @@ class Database:
         metadata: Mapping[str, object],
     ) -> int:
         """Append bounded mutation metadata without content, URL queries, or secrets."""
+        for field, value in (
+            ("actor", actor),
+            ("operation", operation),
+            ("target_type", target_type),
+            ("target_id", target_id),
+            ("outcome", outcome),
+        ):
+            if not value or len(value) > 128 or any(character.isspace() for character in value):
+                raise ValueError(f"audit {field} must be a bounded opaque identifier")
         encoded = _json_object(metadata, field="audit_metadata")
         with self._connection() as connection:
             cursor = connection.execute(
