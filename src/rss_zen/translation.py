@@ -16,6 +16,11 @@ from rss_zen.db import ArticleRecord, Database, TranslationInput
 from rss_zen.errors import AppError
 from rss_zen.models import TranslationProviderConfig, TranslationSettings
 
+try:
+    from deep_translator import GoogleTranslator
+except Exception:  # pragma: no cover - optional dependency
+    GoogleTranslator = None
+
 DetectorFactory.seed = 0
 
 
@@ -135,7 +140,9 @@ class OpenAICompatibleProvider:
         self._budget = budget
 
     def translate(self, text: str, source_language: str | None, target_language: str) -> str:
-        chunks = _split_text_chunks(text, max_chars=self._max_chars)
+        # deep_translator requires len(chunk) < 5000 (strict); subdivide with a safe margin.
+        safe_max = min(self._max_chars, 4500)
+        chunks = _split_text_chunks(text, max_chars=safe_max)
         translated_chunks = [
             self._translate_chunk(chunk, source_language, target_language) for chunk in chunks
         ]
@@ -268,6 +275,94 @@ class MyMemoryProvider:
         return translated
 
 
+class GoogleProvider:
+    """Translate through deep_translator's free GoogleTranslate web endpoint.
+
+    Requires no API key or endpoint configuration. Falls back gracefully when the
+    deep_translator package is unavailable or a request is rejected. Long text is
+    split into per-request chunks because GoogleTranslate caps each request.
+    """
+
+    # deep_translator rejects len(text) >= 5000 (strictly less than); keep a safe margin.
+    _default_max_chars = 4500
+
+    def __init__(
+        self,
+        config: TranslationProviderConfig,
+        client: httpx.Client | None = None,
+        *,
+        budget: RunBudget | None = None,
+    ) -> None:
+        self.name = config.name
+        self.model = None
+        self._timeout = config.timeout_seconds
+        self._max_chars = config.max_chars or self._default_max_chars
+        self._budget = budget
+
+    def translate(self, text: str, source_language: str | None, target_language: str) -> str:
+        if GoogleTranslator is None:
+            raise TranslationProviderError(
+                "translation_unavailable",
+                "deep_translator is not installed; google provider unavailable",
+                retryable=False,
+            )
+        # deep_translator requires len(chunk) < 5000 (strict); subdivide with a safe margin.
+        safe_max = min(self._max_chars, 4500)
+        chunks = _split_text_chunks(text, max_chars=safe_max)
+        translated_chunks = [
+            self._translate_chunk(chunk, source_language, target_language) for chunk in chunks
+        ]
+        return "\n".join(translated_chunks).strip()
+
+    def _translate_chunk(
+        self, text: str, source_language: str | None, target_language: str
+    ) -> str:
+        _reserve_provider_request(self._budget, text)
+        try:
+            translator = GoogleTranslator(source="auto", target=target_language)
+            translated = translator.translate(text)
+        except TranslationProviderError:
+            raise
+        except Exception as error:  # deep_translator raises many exception types
+            raise TranslationProviderError(
+                "translation_provider_error",
+                f"Google translation request failed: {error}",
+                retryable=True,
+            ) from error
+        if not isinstance(translated, str) or not translated.strip():
+            raise TranslationProviderError(
+                "translation_invalid_response", "Google returned no translated text"
+            )
+        if _looks_like_google_error_page(translated):
+            raise TranslationProviderError(
+                "translation_provider_error",
+                "Google returned an error page instead of translated text",
+                retryable=True,
+            )
+        return translated
+
+
+def _looks_like_google_error_page(text: str) -> bool:
+    """Detect Google Translate web error pages returned as text.
+
+    The free GoogleTranslate endpoint occasionally returns an HTML error page
+    (e.g. HTTP 429/500 body) that deep_translator passes through verbatim.
+    """
+    if not text:
+        return False
+    markers = (
+        "Error 500",
+        "That's an error",
+        "Server Error",
+        "Too Many Requests",
+        "try again later",
+        "Our systems have detected unusual traffic",
+        "This page appears to be broken",
+    )
+    lowered = text[:400].casefold()
+    return any(marker.casefold() in lowered for marker in markers)
+
+
 class TranslationService:
     """Translate source articles through a provider chain and persist every outcome."""
 
@@ -313,6 +408,26 @@ class TranslationService:
             detected_language=detected_language,
             source_language=source_language,
         )
+        if not force and _is_chinese_source(source_language) and _is_chinese_target(self._target_language):
+            # Source and target are both Chinese (e.g. zh-TW -> zh-CN); translation
+            # is unnecessary. Mark as succeeded with the original text so the
+            # article participates in exports/editions without burning provider quota.
+            self._database.save_translation(
+                TranslationInput(
+                    article_id=article.id,
+                    target_language=self._target_language,
+                    title=article.title,
+                    summary=article.summary,
+                    content=article.content,
+                    provider_name="passthrough",
+                    provider_model=None,
+                    status="succeeded",
+                    source_hash=article.content_hash,
+                    attempt_count=0,
+                    last_attempt_at=self._timestamp(),
+                )
+            )
+            return TranslationOutcome(article.id, "succeeded", "passthrough")
         existing = self._database.latest_translation(article.id, self._target_language)
         if (
             not force
@@ -452,6 +567,8 @@ def build_translation_service(
             providers.append(LibreTranslateProvider(provider, client, budget=provider_budget))
         elif provider.kind == "mymemory":
             providers.append(MyMemoryProvider(provider, client, budget=provider_budget))
+        elif provider.kind == "google":
+            providers.append(GoogleProvider(provider, client, budget=provider_budget))
         else:
             providers.append(OpenAICompatibleProvider(provider, client, budget=provider_budget))
     return TranslationService(
@@ -462,6 +579,20 @@ def build_translation_service(
         max_backoff_minutes=max_backoff_minutes,
         max_translation_chars=max_translation_chars,
     )
+
+
+def _is_chinese_source(language: str | None) -> bool:
+    """Return True when the source language is any Chinese variant."""
+    if not language:
+        return False
+    base = language.casefold().replace("_", "-")
+    return base in {"zh", "zh-cn", "zh-tw", "zh-hk", "zh-sg", "cmn"} or base.startswith("zh-")
+
+
+def _is_chinese_target(language: str) -> bool:
+    """Return True when the target language is Chinese."""
+    base = language.casefold().replace("_", "-")
+    return base in {"zh", "zh-cn", "zh-tw", "zh-hk", "zh-sg"} or base.startswith("zh-")
 
 
 def detect_article_language(article: ArticleRecord) -> str | None:

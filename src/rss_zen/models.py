@@ -161,7 +161,7 @@ class TranslationProviderConfig(BaseModel):
     @field_validator("kind")
     @classmethod
     def _supported_kind(cls, value: str) -> str:
-        supported = {"libretranslate", "mymemory", "openai_compatible"}
+        supported = {"libretranslate", "mymemory", "openai_compatible", "google"}
         if value not in supported:
             raise ValueError(f"unsupported translation provider kind: {value}")
         return value

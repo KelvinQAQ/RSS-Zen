@@ -314,6 +314,23 @@ build_release() {
   )
   chmod -R a+rX "${staging_dir}"
   mv -T "${staging_dir}" "${RELEASE_DIR}"
+
+  # Fix absolute paths written by uv editable-install after directory move
+  local venv_dir="${RELEASE_DIR}/.venv"
+  if [[ -d "${venv_dir}" ]]; then
+    # Fix editable .pth files
+    find "${venv_dir}/lib" -name '_editable_impl_*.pth' -type f 2>/dev/null | while read -r pth; do
+      sed -i "s|${staging_dir}|${RELEASE_DIR}|g" "${pth}"
+    done
+    # Fix shebangs in bin/ scripts
+    local shebang_old="#!${staging_dir}/.venv/bin/python"
+    local shebang_new="#!${RELEASE_DIR}/.venv/bin/python"
+    for script in "${venv_dir}/bin"/*; do
+      [[ -f "${script}" ]] || continue
+      head -1 "${script}" 2>/dev/null | grep -q "^${shebang_old}" || continue
+      sed -i "1s|^${shebang_old}|${shebang_new}|" "${script}"
+    done
+  fi
 }
 
 rollback_release() {

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -19,7 +20,10 @@ from rss_zen.db import (
 )
 from rss_zen.editorial import EditorialRequest, EditorialService
 from rss_zen.export import _dedupe_by_title, _filter_by_keywords
+from markdownify import markdownify
+
 from rss_zen.markdown import escape_inline_text, safe_markdown_url
+from rss_zen.markdown import escape_link_label
 
 
 @dataclass(frozen=True)
@@ -403,11 +407,19 @@ def _render_edition(
     sources = content_sources or tuple(_content_source(record) for record in records)
     if len(sources) != len(records):
         raise ValueError("content provenance does not match edition records")
-    for record, content_source in zip(records, sources, strict=True):
+    if records:
+        lines.extend(["## 📑 今日目录", ""])
+        for index, record in enumerate(records, start=1):
+            lines.append(
+                f"{index}. [{escape_link_label(_title(record))}](#toc-{index})"
+            )
+        lines.append("")
+    for index, (record, content_source) in enumerate(zip(records, sources), start=1):
         title = _title(record)
         content = _content(record, content_source)
         lines.extend(
             [
+                f'<a id="toc-{index}"></a>',
                 f"## {escape_inline_text(title)}",
                 "",
                 f"- 来源: {escape_inline_text(record.feed_name)}",
@@ -442,14 +454,24 @@ def _content_source(record: ExportArticleRecord) -> str:
 
 def _content(record: ExportArticleRecord, source: str) -> str:
     if source == "extracted_full_text":
-        return record.extraction.translated_content or ""
-    if source == "rss_content":
-        return record.translation.content or ""
-    if source == "rss_summary":
-        return record.translation.summary or ""
-    if source == "original_rss_content":
-        return record.article.content or ""
-    return record.article.summary or ""
+        raw = record.extraction.translated_content or ""
+    elif source == "rss_content":
+        raw = record.translation.content or ""
+    elif source == "rss_summary":
+        raw = record.translation.summary or ""
+    elif source == "original_rss_content":
+        raw = record.article.content or ""
+    else:
+        raw = record.article.summary or ""
+    return _clean_html(raw)
+
+
+def _clean_html(raw: str) -> str:
+    """Convert RSS HTML body to clean Markdown and collapse whitespace."""
+    if not raw:
+        return ""
+    rendered = markdownify(raw, heading_style="ATX")
+    return re.sub(r"\n{3,}", "\n\n", rendered).strip()
 
 
 def _content_source_label(source: str) -> str:
