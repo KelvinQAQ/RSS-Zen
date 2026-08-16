@@ -194,13 +194,17 @@ def _filter_by_keywords(
     kept: list[ExportArticleRecord] = []
     for record in records:
         if match_mode == "groups":
-            # Title-only haystacks keep groups matching precise: the topic and
-            # region signals must both appear in the title, avoiding summary
-            # noise (e.g. "strategic" or "intelligence" in business copy).
+            # 主题词只查标题（保持精确）；区域词先查标题，标题未命中时
+            # 回退到正文（若已提取全文），以召回"正文隐含印太"的文章
+            # （如 IAF/RMAF 演习、美防务工业涉印太等标题无地域词的报道）。
             title_haystacks = _record_title_haystacks(record, include_summary=False)
-            matched = _matches(title_patterns, title_haystacks) and _matches(
-                body_patterns, title_haystacks
-            )
+            theme_hit = _matches(title_patterns, title_haystacks)
+            region_hit = _matches(body_patterns, title_haystacks)
+            if theme_hit and not region_hit:
+                body_haystacks = _record_body_haystacks(record)
+                if body_haystacks:
+                    region_hit = _matches(body_patterns, body_haystacks)
+            matched = theme_hit and region_hit
         else:
             title_haystacks = _record_title_haystacks(record)
             body_haystacks = _record_body_haystacks(record)

@@ -33,45 +33,58 @@ def _article(database: Database):
     return article
 
 
-def test_anysearch_posts_documented_request_and_requires_exact_url_match() -> None:
+def test_anysearch_posts_documented_request_and_returns_extract_content() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "POST"
-        assert request.url == "https://api.anysearch.com/v1/search"
+        assert request.url == "https://api.anysearch.com/mcp"
         assert request.headers["authorization"] == "Bearer test-key"
         payload = json.loads(request.content)
         assert payload == {
-            "query": "https://example.test/articles/one",
-            "tag": "general.general",
-            "zone": "intl",
-            "language": "zh-CN",
-            "max_results": 3,
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "extract",
+                "arguments": {"url": "https://example.test/articles/one"},
+            },
         }
         return httpx.Response(
             200,
             json={
-                "code": 0,
-                "message": "success",
-                "request_id": "request-1",
-                "data": {
-                    "results": [
-                        {"url": "https://other.test/article", "content": "Ignore this"},
-                        {
-                            "url": "https://example.test/articles/one",
-                            "title": "Article",
-                            "content": "Full article body",
-                        },
-                    ]
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "content": [{"type": "text", "text": "Full article body"}]
                 },
             },
         )
 
-    settings = AnySearchSettings(api_key="test-key", zone="intl", language="zh-CN")
+    settings = AnySearchSettings(api_key="test-key")
     extractor = AnySearchExtractor(settings, httpx.Client(transport=httpx.MockTransport(handler)))
 
     result = extractor.extract("https://example.test/articles/one")
 
     assert result.content == "Full article body"
-    assert result.request_id == "request-1"
+    assert result.request_id is None
+
+
+def test_anysearch_extract_returns_error_envelope() -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {"code": -32000, "message": "extract failed"},
+            },
+        )
+
+    settings = AnySearchSettings(api_key="test-key")
+    extractor = AnySearchExtractor(settings, httpx.Client(transport=httpx.MockTransport(handler)))
+
+    with pytest.raises(Exception) as exc_info:
+        extractor.extract("https://example.test/articles/one")
+    assert exc_info.value.code == "anysearch_api_error"
 
 
 def test_anysearch_budget_rejects_before_http_call() -> None:

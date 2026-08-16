@@ -62,25 +62,28 @@ class AnySearchExtractor:
         self._budget = budget
 
     def extract(self, source_url: str) -> ExtractionResponse:
-        """Search for a URL and accept only a response with the exact canonical URL."""
+        """Extract full page content via the AnySearch `extract` MCP tool.
+
+        Uses the JSON-RPC 2.0 ``/mcp`` endpoint with ``tools/call`` and the
+        ``extract`` tool (URL in, full page content out). Unlike the old
+        ``/v1/search``+exact-URL-match approach, this returns the page content
+        directly and does not depend on search-result URL normalization.
+        """
         canonical_url = _normalize_url(source_url)
         headers = {"Content-Type": "application/json"}
         if self._settings.api_key:
             headers["Authorization"] = f"Bearer {self._settings.api_key}"
-        payload: dict[str, object] = {
-            "query": canonical_url,
-            "tag": self._settings.tag,
-            "max_results": self._settings.max_results,
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "extract", "arguments": {"url": canonical_url}},
         }
-        if self._settings.zone is not None:
-            payload["zone"] = self._settings.zone
-        if self._settings.language is not None:
-            payload["language"] = self._settings.language
         if self._budget is not None:
             self._budget.reserve(source_chars=len(canonical_url))
         try:
             response = self._client.post(
-                f"{self._settings.base_url}/v1/search", headers=headers, json=payload
+                f"{self._settings.base_url}/mcp", headers=headers, json=payload
             )
         except httpx.TimeoutException as error:
             raise AppError(
@@ -94,31 +97,34 @@ class AnySearchExtractor:
         request_id, body = _response_body(response)
         if response.status_code >= 400:
             raise _http_error(response.status_code, request_id, body)
-        if body.get("code") != 0:
-            message = body.get("message")
+        if body.get("error"):
+            message = body.get("error")
+            if isinstance(message, Mapping):
+                message = message.get("message") or str(message)
             safe_message = message if isinstance(message, str) else "AnySearch returned an error"
             raise AppError("anysearch_api_error", safe_message)
 
-        data = body.get("data")
-        results = data.get("results") if isinstance(data, Mapping) else None
-        if not isinstance(results, list):
-            raise AppError("anysearch_invalid_response", "AnySearch returned no result list")
-        for result in results:
-            if not isinstance(result, Mapping):
-                continue
-            result_url = result.get("url")
-            content = result.get("content")
-            if (
-                isinstance(result_url, str)
-                and isinstance(content, str)
-                and content.strip()
-                and _normalize_url(result_url) == canonical_url
-            ):
-                return ExtractionResponse(content, canonical_url, request_id)
-        raise AppError(
-            "anysearch_exact_source_not_found",
-            "AnySearch did not return content for the exact article URL",
-        )
+        result = body.get("result")
+        if not isinstance(result, Mapping):
+            raise AppError("anysearch_invalid_response", "AnySearch returned no result")
+        content_parts = result.get("content")
+        text = ""
+        if isinstance(content_parts, list):
+            for part in content_parts:
+                if isinstance(part, Mapping):
+                    part_type = part.get("type")
+                    part_text = part.get("text")
+                    if isinstance(part_text, str) and part_text.strip():
+                        text += part_text + "\n"
+                elif isinstance(part, str) and part.strip():
+                    text += part + "\n"
+        elif isinstance(content_parts, str) and content_parts.strip():
+            text = content_parts
+        if not text.strip():
+            raise AppError(
+                "anysearch_extract_empty", "AnySearch extract returned no content"
+            )
+        return ExtractionResponse(text.strip(), canonical_url, request_id)
 
 
 class ExtractionService:
