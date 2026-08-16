@@ -283,6 +283,12 @@ def _record_body_haystacks(record: ExportArticleRecord) -> list[str]:
         haystacks.append(article.content)
     if translated and translation.content:
         haystacks.append(translation.content)
+    # 已提取全文（extractions 表）也参与正文匹配
+    if record.extraction is not None:
+        if record.extraction.content:
+            haystacks.append(record.extraction.content)
+        if record.extraction.translated_content:
+            haystacks.append(record.extraction.translated_content)
     return haystacks
 
 
