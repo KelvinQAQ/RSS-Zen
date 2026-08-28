@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, time
 from pathlib import Path
 
 import httpx
@@ -453,3 +454,117 @@ def test_translation_limits_source_field_size(tmp_path: Path) -> None:
     assert provider.calls[0][0] == "English"
     assert provider.calls[1][0] == "English"
     assert provider.calls[2][0] == "This is"
+
+
+def test_budget_exhausted_defers_retry_to_next_local_day(tmp_path: Path) -> None:
+    """#4: budget exhaustion must defer retry to the next day, not churn today."""
+    database = Database(tmp_path / "rss-zen.sqlite3")
+    database.initialize()
+    article = _article(database)
+    calls = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"translatedText": "中文"})
+
+    settings = TranslationSettings(
+        providers=[
+            TranslationProviderConfig(
+                name="free",
+                kind="libretranslate",
+                endpoint="https://translate.example.test/translate",
+            )
+        ]
+    )
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        service = build_translation_service(
+            database,
+            settings,
+            client,
+            persistent_daily_limits=(1, 1000),
+            budget_timezone="Asia/Shanghai",
+            budget_defer_time=time(5, 0),
+        )
+        result = service.translate_article(article, source_language_override="en")
+
+    stored = database.latest_translation(article.id, "zh-CN")
+    assert result.error_code == "provider_daily_budget_exhausted"
+    assert stored is not None
+    assert stored.terminal is False
+    assert stored.next_retry_at is not None
+    retry_dt = datetime.fromisoformat(stored.next_retry_at)
+    elapsed = (retry_dt - datetime.now(UTC)).total_seconds()
+    # Deferred to next local day: at least ~hours away, not a <1h same-day retry.
+    assert elapsed >= 5 * 3600, f"expected defer to next day, got {elapsed/3600:.1f}h"
+
+
+def test_rate_limited_error_uses_longer_cooldown(tmp_path: Path) -> None:
+    """#5: rate-limited (429) errors back off with a dedicated longer cooldown."""
+    database = Database(tmp_path / "rss-zen.sqlite3")
+    database.initialize()
+    article = _article(database)
+
+    class RateLimitedProvider:
+        name = "ratelimited"
+        model = None
+
+        def translate(self, text, source_language, target_language) -> str:
+            raise TranslationProviderError(
+                "translation_http_429", "too many requests", retryable=True
+            )
+
+    service = TranslationService(
+        database,
+        [RateLimitedProvider()],
+        target_language="zh-CN",
+        max_attempts=5,
+        rate_limit_backoff_minutes=120,
+        max_backoff_minutes=360,
+    )
+
+    service.translate_article(article, source_language_override="en")
+
+    stored = database.latest_translation(article.id, "zh-CN")
+    assert stored is not None
+    assert stored.status == "failed"
+    assert stored.error_code == "translation_http_429"
+    assert stored.terminal is False
+    assert stored.next_retry_at is not None
+    retry_dt = datetime.fromisoformat(stored.next_retry_at)
+    elapsed = (retry_dt - datetime.now(UTC)).total_seconds()
+    # Base backoff for attempt 1 is 1 minute; the 120m rate-limit floor must win.
+    assert elapsed >= 110 * 60, f"expected rate-limit cooldown >=120m, got {elapsed/60:.1f}m"
+
+
+def test_normal_retryable_error_keeps_short_backoff(tmp_path: Path) -> None:
+    """Non-rate-limit, non-budget retryable errors keep the standard backoff."""
+    database = Database(tmp_path / "rss-zen.sqlite3")
+    database.initialize()
+    article = _article(database)
+
+    class RetryableProvider:
+        name = "retryable"
+        model = None
+
+        def translate(self, text, source_language, target_language) -> str:
+            raise TranslationProviderError(
+                "translation_provider_error", "flaky", retryable=True
+            )
+
+    service = TranslationService(
+        database,
+        [RetryableProvider()],
+        target_language="zh-CN",
+        rate_limit_backoff_minutes=120,
+        max_backoff_minutes=360,
+    )
+
+    service.translate_article(article, source_language_override="en")
+
+    stored = database.latest_translation(article.id, "zh-CN")
+    assert stored is not None
+    assert stored.next_retry_at is not None
+    retry_dt = datetime.fromisoformat(stored.next_retry_at)
+    elapsed = (retry_dt - datetime.now(UTC)).total_seconds()
+    assert elapsed < 60 * 60, f"expected short backoff, got {elapsed/60:.1f}m"

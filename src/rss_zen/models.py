@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from datetime import time as time_
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
@@ -34,6 +35,17 @@ class ServiceSettings(BaseModel):
     translation_retry_interval_minutes: int = Field(default=5, ge=1)
     translation_max_attempts: int = Field(default=5, ge=1)
     retry_max_backoff_minutes: int = Field(default=360, ge=1)
+    translation_rate_limit_backoff_minutes: int = Field(default=60, ge=1, le=1440)
+    translation_budget_defer_time: str = Field(default="05:00")
+
+    @field_validator("translation_budget_defer_time")
+    @classmethod
+    def _valid_defer_time(cls, value: str) -> str:
+        time_.fromisoformat(value)
+        parts = value.split(":")
+        if len(parts) != 2 or not 0 <= int(parts[0]) <= 23 or not 0 <= int(parts[1]) <= 59:
+            raise ValueError("translation_budget_defer_time must use HH:MM (e.g. '05:00')")
+        return value
 
 
 class LimitsSettings(BaseModel):

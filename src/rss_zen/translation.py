@@ -5,8 +5,10 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from datetime import time as time_
 from random import Random
 from typing import Protocol
+from zoneinfo import ZoneInfo
 
 import httpx
 from langdetect import DetectorFactory, LangDetectException, detect
@@ -375,6 +377,9 @@ class TranslationService:
         max_attempts: int = 5,
         max_backoff_minutes: int = 360,
         max_translation_chars: int = 100_000,
+        rate_limit_backoff_minutes: int = 60,
+        budget_timezone: str = "Asia/Shanghai",
+        budget_defer_time: time_ = time_(5, 0),
         now: Callable[[], datetime] | None = None,
         random: Random | None = None,
     ) -> None:
@@ -390,6 +395,9 @@ class TranslationService:
         self._max_attempts = max_attempts
         self._max_backoff_minutes = max_backoff_minutes
         self._max_translation_chars = max_translation_chars
+        self._rate_limit_backoff_minutes = rate_limit_backoff_minutes
+        self._budget_timezone = ZoneInfo(budget_timezone)
+        self._budget_defer_time = budget_defer_time
         self._now = now or (lambda: datetime.now(UTC))
         self._random = random or Random()
 
@@ -408,7 +416,10 @@ class TranslationService:
             detected_language=detected_language,
             source_language=source_language,
         )
-        if not force and _is_chinese_source(source_language) and _is_chinese_target(self._target_language):
+        both_chinese = _is_chinese_source(source_language) and _is_chinese_target(
+            self._target_language
+        )
+        if not force and both_chinese:
             # Source and target are both Chinese (e.g. zh-TW -> zh-CN); translation
             # is unnecessary. Mark as succeeded with the original text so the
             # article participates in exports/editions without burning provider quota.
@@ -485,6 +496,7 @@ class TranslationService:
         )
         attempts = pending.attempt_count + 1
         terminal = not error.retryable or attempts >= self._max_attempts
+        next_retry_at = None if terminal else self._next_retry_at(attempts, error.code)
         self._database.save_translation(
             TranslationInput(
                 article_id=article.id,
@@ -499,7 +511,7 @@ class TranslationService:
                 error_code=error.code,
                 error_message=error.message,
                 attempt_count=attempts,
-                next_retry_at=None if terminal else self._next_retry_at(attempts),
+                next_retry_at=next_retry_at,
                 last_attempt_at=self._timestamp(),
                 terminal=terminal,
             )
@@ -518,10 +530,35 @@ class TranslationService:
     def _timestamp(self) -> str:
         return self._now().astimezone(UTC).isoformat()
 
-    def _next_retry_at(self, attempts: int) -> str:
-        minutes = min(2 ** (attempts - 1), self._max_backoff_minutes)
+    def _next_retry_at(self, attempts: int, error_code: str | None) -> str:
+        """Return an ISO retry time that scales with the failure class.
+
+        - provider_daily_budget_exhausted cannot succeed until the daily budget
+          resets, so defer to the next local day instead of churning retries
+          that can never succeed today (improvement #4).
+        - rate-limit errors (HTTP 429) get a dedicated, longer cooldown floor so
+          a throttled provider is not hammered every few minutes, which preserves
+          the per-day budget for real translation work (improvement #5).
+        """
+        if error_code == "provider_daily_budget_exhausted":
+            return self._next_budget_day()
+        if error_code and ("429" in error_code or "rate_limit" in error_code):
+            floor = max(self._rate_limit_backoff_minutes, 1)
+            minutes = min(max(floor, 2 ** (attempts - 1)), self._max_backoff_minutes)
+        else:
+            minutes = min(2 ** (attempts - 1), self._max_backoff_minutes)
         jitter = self._random.uniform(0.0, min(minutes * 0.1, 5.0))
         return (self._now().astimezone(UTC) + timedelta(minutes=minutes + jitter)).isoformat()
+
+    def _next_budget_day(self) -> str:
+        """Return the next local day at the budget-defer clock time (after reset)."""
+        now = self._now().astimezone(self._budget_timezone)
+        candidate = datetime.combine(
+            now.date(), self._budget_defer_time, tzinfo=self._budget_timezone
+        )
+        if candidate <= now:
+            candidate += timedelta(days=1)
+        return candidate.astimezone(UTC).isoformat()
 
     def translate_text(self, text: str, *, source_language: str | None = None) -> TextTranslation:
         """Translate arbitrary extracted content with the configured fallback chain."""
@@ -549,6 +586,9 @@ def build_translation_service(
     max_attempts: int = 5,
     max_backoff_minutes: int = 360,
     max_translation_chars: int = 100_000,
+    rate_limit_backoff_minutes: int = 60,
+    budget_timezone: str = "Asia/Shanghai",
+    budget_defer_time: time_ = time_(5, 0),
     budget: RunBudget | None = None,
     persistent_daily_limits: tuple[int, int] | None = None,
 ) -> TranslationService:
@@ -578,6 +618,9 @@ def build_translation_service(
         max_attempts=max_attempts,
         max_backoff_minutes=max_backoff_minutes,
         max_translation_chars=max_translation_chars,
+        rate_limit_backoff_minutes=rate_limit_backoff_minutes,
+        budget_timezone=budget_timezone,
+        budget_defer_time=budget_defer_time,
     )
 
 

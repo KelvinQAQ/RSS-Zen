@@ -9,6 +9,10 @@ default_poll_interval_minutes = 30
 translation_retry_interval_minutes = 5
 translation_max_attempts = 5
 retry_max_backoff_minutes = 360
+# 429/限流类翻译失败的最小重试退避时间(分钟)。避免被限流时每几分钟狂试耗尽预算。
+translation_rate_limit_backoff_minutes = 60
+# 当日翻译预算耗尽(provider_daily_budget_exhausted)后，推迟到次日几点重试(HH:MM，本地时区)。
+translation_budget_defer_time = "05:00"
 
 [limits]
 max_feed_response_bytes = 10000000

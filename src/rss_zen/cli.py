@@ -267,6 +267,8 @@ def serve(
                     max_attempts=config.service.translation_max_attempts,
                     max_backoff_minutes=config.service.retry_max_backoff_minutes,
                     max_translation_chars=config.limits.max_translation_chars,
+                    rate_limit_backoff_minutes=config.service.translation_rate_limit_backoff_minutes,
+                    budget_defer_time=time.fromisoformat(config.service.translation_budget_defer_time),
                     persistent_daily_limits=(
                         config.limits.max_background_provider_requests_per_day,
                         config.limits.max_background_source_chars_per_day,
@@ -429,6 +431,8 @@ def sync(
                 client,
                 max_attempts=config.service.translation_max_attempts,
                 max_backoff_minutes=config.service.retry_max_backoff_minutes,
+                rate_limit_backoff_minutes=config.service.translation_rate_limit_backoff_minutes,
+                budget_defer_time=time.fromisoformat(config.service.translation_budget_defer_time),
             )
             results = FeedSyncService(
                 database,
@@ -554,6 +558,8 @@ def translate(
                 client,
                 max_attempts=config.service.translation_max_attempts,
                 max_backoff_minutes=config.service.retry_max_backoff_minutes,
+                rate_limit_backoff_minutes=config.service.translation_rate_limit_backoff_minutes,
+                budget_defer_time=time.fromisoformat(config.service.translation_budget_defer_time),
                 budget=budget,
             )
             outcomes = []
@@ -736,6 +742,8 @@ def extract(
                 client,
                 max_attempts=config.service.translation_max_attempts,
                 max_backoff_minutes=config.service.retry_max_backoff_minutes,
+                rate_limit_backoff_minutes=config.service.translation_rate_limit_backoff_minutes,
+                budget_defer_time=time.fromisoformat(config.service.translation_budget_defer_time),
                 budget=budget,
             )
             service = ExtractionService(
