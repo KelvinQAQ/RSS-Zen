@@ -320,3 +320,65 @@ def test_builder_can_render_bounded_untranslated_fallback_as_degraded(tmp_path: 
     assert "Original RSS body" in rendered
     assert "内容来源: RSS 全文（原文）" in rendered
     assert database.edition_item_article_ids(result.edition.id) == (article.id,)
+
+
+def test_builder_returns_existing_delivered_edition_idempotently_after_content_drift(
+    tmp_path: Path,
+) -> None:
+    """A delivered (terminal) edition must not be re-validated for reproducibility.
+
+    The deadline coordinator re-runs every minute all day. Once an edition has been
+    delivered, re-rendering it and comparing hashes can spuriously fail if a
+    constituent article was re-translated/extracted after delivery (content drift).
+    Previously this raised "queued edition artifact hash is not reproducible" and
+    marked the deadline systemd unit as failed every minute despite a successful
+    daily delivery. Now the delivered edition is returned idempotently.
+    """
+    database = _database(tmp_path)
+    topic = _topic(database, max_candidates=1)
+    article = _article(database, guid="drift-a1", title="Taiwan drift")
+    _translate(database, article, title="台湾漂移", summary="摘要 v1")
+    builder = EditionBuilder(
+        database, target_language="zh-CN", output_directory=tmp_path / "editions"
+    )
+
+    first = builder.build(
+        topic,
+        local_date="2026-08-14",
+        deadline_at="2026-08-13T23:30:00+00:00",
+        target_ref="chat:approved-digest",
+    )
+
+    claims = database.claim_due_deliveries(
+        worker_id="worker-1",
+        now="2026-08-14T01:00:00+00:00",
+        lease_expires_at="2026-08-14T01:05:00+00:00",
+        limit=10,
+    )
+    assert len(claims) == 1
+    database.record_delivery_success(
+        claims[0].id, worker_id="worker-1", provider_message_id="msg-1"
+    )
+    assert database.get_edition_run(first.edition.id).status == "delivered"
+
+    _translate(
+        database,
+        article,
+        title="台湾漂移改稿",
+        summary="摘要 v2 内容已变化",
+        content="重新提取的正文内容",
+    )
+    _records = database.edition_items(first.edition.id)
+
+    second = builder.build(
+        topic,
+        local_date="2026-08-14",
+        deadline_at="2026-08-13T23:30:00+00:00",
+        target_ref="chat:approved-digest",
+    )
+
+    assert second.edition.id == first.edition.id
+    assert second.delivery.id == first.delivery.id
+    assert second.artifact_sha256 == first.artifact_sha256
+    assert second.edition.status == "delivered"
+    assert len(_records) == 1

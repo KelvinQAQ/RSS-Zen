@@ -345,6 +345,22 @@ class EditionBuilder:
     ) -> EditionBuildResult:
         if delivery.target_ref != target_ref:
             raise ValueError("existing edition is bound to a different target")
+        if edition.status in {"delivered", "terminal"} or delivery.status in {
+            "delivered",
+            "terminal",
+        }:
+            # Already delivered and terminal: the edition is immutable and was
+            # fixed and sent. Return idempotently without the reproducibility
+            # check, which can spuriously fail if a constituent article was
+            # re-translated/extracted after delivery (content drift).
+            return EditionBuildResult(
+                edition=edition,
+                delivery=delivery,
+                artifact_path=edition.artifact_path,
+                artifact_sha256=edition.artifact_sha256,
+                article_count=edition.candidate_count,
+                degraded=edition.degraded_reason_code is not None,
+            )
         if edition.artifact_path is None or edition.artifact_sha256 is None:
             raise ValueError("queued edition is missing artifact metadata")
         records = self._records_for_frozen_items(edition.id)
