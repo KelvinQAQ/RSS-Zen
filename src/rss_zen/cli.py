@@ -23,6 +23,7 @@ from rss_zen.db import Database, TopicProfileInput
 from rss_zen.delivery import DeliveryWorker
 from rss_zen.edition import EditionBuilder
 from rss_zen.editorial import EditorialService, PiEditorialRunner
+from rss_zen.edition_priority import build_edition_priority
 from rss_zen.errors import AppError, ConfigurationError
 from rss_zen.export import MarkdownExporter
 from rss_zen.extraction import AnySearchExtractor, ExtractionService
@@ -269,6 +270,11 @@ def serve(
                     max_translation_chars=config.limits.max_translation_chars,
                     rate_limit_backoff_minutes=config.service.translation_rate_limit_backoff_minutes,
                     budget_defer_time=time.fromisoformat(config.service.translation_budget_defer_time),
+                    edition_priority=(
+                        build_edition_priority(config.topics)
+                        if config.service.translation_prioritize_edition
+                        else None
+                    ),
                     persistent_daily_limits=(
                         config.limits.max_background_provider_requests_per_day,
                         config.limits.max_background_source_chars_per_day,

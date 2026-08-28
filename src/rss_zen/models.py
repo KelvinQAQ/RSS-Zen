@@ -37,6 +37,7 @@ class ServiceSettings(BaseModel):
     retry_max_backoff_minutes: int = Field(default=360, ge=1)
     translation_rate_limit_backoff_minutes: int = Field(default=60, ge=1, le=1440)
     translation_budget_defer_time: str = Field(default="05:00")
+    translation_prioritize_edition: bool = Field(default=True)
 
     @field_validator("translation_budget_defer_time")
     @classmethod

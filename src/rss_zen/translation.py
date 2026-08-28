@@ -15,6 +15,7 @@ from langdetect import DetectorFactory, LangDetectException, detect
 
 from rss_zen.budget import PersistentProviderBudget, RunBudget
 from rss_zen.db import ArticleRecord, Database, TranslationInput
+from rss_zen.edition_priority import EditionPriorityMatcher
 from rss_zen.errors import AppError
 from rss_zen.models import TranslationProviderConfig, TranslationSettings
 
@@ -380,6 +381,7 @@ class TranslationService:
         rate_limit_backoff_minutes: int = 60,
         budget_timezone: str = "Asia/Shanghai",
         budget_defer_time: time_ = time_(5, 0),
+        edition_priority: EditionPriorityMatcher | None = None,
         now: Callable[[], datetime] | None = None,
         random: Random | None = None,
     ) -> None:
@@ -398,6 +400,7 @@ class TranslationService:
         self._rate_limit_backoff_minutes = rate_limit_backoff_minutes
         self._budget_timezone = ZoneInfo(budget_timezone)
         self._budget_defer_time = budget_defer_time
+        self._edition_priority = edition_priority
         self._now = now or (lambda: datetime.now(UTC))
         self._random = random or Random()
 
@@ -518,12 +521,48 @@ class TranslationService:
         )
         return TranslationOutcome(article.id, "failed", self._providers[-1].name, error.code)
 
+    def is_edition_candidate(self, article: ArticleRecord) -> bool:
+        """Return True when the article should be prioritized for translation."""
+        if self._edition_priority is None:
+            # No configured topics: nothing is specially prioritized.
+            return False
+        return self._edition_priority.is_candidate(article)
+
+    def translate_prioritized(
+        self,
+        articles: Sequence[ArticleRecord],
+        *,
+        source_language_override: str | None = None,
+    ) -> list[TranslationOutcome]:
+        """Translate a batch with edition-candidate articles first.
+
+        Spend the limited budget on articles that will reach the daily report
+        before consuming quota on non-candidates (Plan A). Articles already
+        without a relevance rule are treated as non-priority.
+        """
+        candidates = []
+        others = []
+        for article in articles:
+            (candidates if self.is_edition_candidate(article) else others).append(article)
+        ordered = candidates + others
+        return [
+            self.translate_article(article, source_language_override=source_language_override)
+            for article in ordered
+        ]
+
     def retry_due(self, *, limit: int = 100) -> list[TranslationOutcome]:
         """Retry due, non-terminal persisted translations without invoking extraction."""
+        due = self._database.list_due_translations(
+            self._target_language, now=self._timestamp(), limit=max(limit, 1000)
+        )
+        # Edition-candidate articles are retried first so their budget is spent
+        # ahead of non-candidates before re-stamping the global due limit.
+        if self._edition_priority is not None:
+            due.sort(
+                key=lambda row: not self.is_edition_candidate(row[0]),
+            )
         outcomes = []
-        for article, _translation in self._database.list_due_translations(
-            self._target_language, now=self._timestamp(), limit=limit
-        ):
+        for article, _translation in due[:limit]:
             outcomes.append(self.translate_article(article, force=True))
         return outcomes
 
@@ -589,6 +628,7 @@ def build_translation_service(
     rate_limit_backoff_minutes: int = 60,
     budget_timezone: str = "Asia/Shanghai",
     budget_defer_time: time_ = time_(5, 0),
+    edition_priority: EditionPriorityMatcher | None = None,
     budget: RunBudget | None = None,
     persistent_daily_limits: tuple[int, int] | None = None,
 ) -> TranslationService:
@@ -621,6 +661,7 @@ def build_translation_service(
         rate_limit_backoff_minutes=rate_limit_backoff_minutes,
         budget_timezone=budget_timezone,
         budget_defer_time=budget_defer_time,
+        edition_priority=edition_priority,
     )
 
 

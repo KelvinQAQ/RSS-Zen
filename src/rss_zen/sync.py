@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 
 import feedparser
 
-from rss_zen.db import ArticleInput, Database, FeedRecord
+from rss_zen.db import ArticleInput, ArticleRecord, Database, FeedRecord
 from rss_zen.errors import AppError
 from rss_zen.http_client import FeedHttpClient
 from rss_zen.models import LimitsSettings
@@ -98,6 +98,7 @@ class FeedSyncService:
             created = 0
             updated = 0
             article_ids = []
+            to_translate: list[ArticleRecord] = []
             for entry in entries:
                 article = _entry_to_article(
                     entry, feed.url, max_article_chars=self._limits.max_article_chars
@@ -113,10 +114,13 @@ class FeedSyncService:
                 if self._translation_service and (
                     reconciliation.created or reconciliation.content_changed
                 ):
-                    self._translation_service.translate_article(
-                        reconciliation.article,
-                        source_language_override=feed.language,
-                    )
+                    to_translate.append(reconciliation.article)
+            if self._translation_service and to_translate:
+                # Prioritize edition-candidate articles so the daily report
+                # budget is spent on it before non-candidates (Plan A).
+                self._translation_service.translate_prioritized(
+                    to_translate, source_language_override=feed.language
+                )
             self._database.record_feed_success(
                 feed.id,
                 etag=response.headers.get("ETag"),
