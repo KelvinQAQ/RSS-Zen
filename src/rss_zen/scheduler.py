@@ -13,6 +13,31 @@ from rss_zen.db import Database
 from rss_zen.sync import FeedSyncService
 from rss_zen.translation import TranslationService
 
+# All feeds share one startup base time, so dozens of jobs become due in the same
+# second. The default APScheduler misfire_grace_time of 1s makes any job that waits
+# in the executor queue for more than a second get silently dropped, which starves
+# whatever feed loses the race on every tick. A generous grace window keeps queued
+# jobs running instead of discarding them.
+DEFAULT_MISFIRE_GRACE_TIME_SECONDS = 600
+DEFAULT_EXECUTOR_MAX_WORKERS = 20
+
+
+def build_default_scheduler() -> BlockingScheduler:
+    """Build the default scheduler with a queue-tolerant misfire window."""
+    return BlockingScheduler(
+        job_defaults={
+            "misfire_grace_time": DEFAULT_MISFIRE_GRACE_TIME_SECONDS,
+            "coalesce": True,
+            "max_instances": 1,
+        },
+        executors={
+            "default": {
+                "type": "threadpool",
+                "max_workers": DEFAULT_EXECUTOR_MAX_WORKERS,
+            }
+        },
+    )
+
 
 class SchedulerBackend(Protocol):
     """Minimal scheduler surface used by FeedScheduler."""
@@ -53,7 +78,7 @@ class FeedScheduler:
         self._default_interval_minutes = default_interval_minutes
         self._translation_service = translation_service
         self._translation_retry_interval_minutes = translation_retry_interval_minutes
-        self._scheduler: SchedulerBackend = scheduler or BlockingScheduler()
+        self._scheduler: SchedulerBackend = scheduler or build_default_scheduler()
         self._logger = logging.getLogger("rss_zen.scheduler")
         self._stopping = False
 

@@ -152,3 +152,29 @@ def test_scheduler_shutdown_stops_backend_and_prevents_new_work(tmp_path: Path) 
 
     assert fake_scheduler.shutdown_calls == [True]
     assert sync_service.calls == []
+
+
+def test_default_scheduler_tolerates_executor_queue_delay() -> None:
+    """Dozens of feeds come due together; queued jobs must not be dropped as misfires.
+
+    With APScheduler's 1s default grace window, any job that waits behind the
+    thread pool for more than a second is skipped forever, which silently starved
+    individual feeds (see production incident 2026-09-13).
+    """
+    from rss_zen.scheduler import (
+        DEFAULT_EXECUTOR_MAX_WORKERS,
+        DEFAULT_MISFIRE_GRACE_TIME_SECONDS,
+        build_default_scheduler,
+    )
+
+    scheduler = build_default_scheduler()
+    try:
+        assert scheduler._job_defaults["misfire_grace_time"] >= 300
+        assert scheduler._job_defaults["misfire_grace_time"] == (
+            DEFAULT_MISFIRE_GRACE_TIME_SECONDS
+        )
+        assert scheduler._job_defaults["coalesce"] is True
+        executor = scheduler._lookup_executor("default")
+        assert executor._pool._max_workers == DEFAULT_EXECUTOR_MAX_WORKERS
+    finally:
+        scheduler.shutdown(wait=False) if scheduler.running else None
