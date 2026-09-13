@@ -45,6 +45,7 @@ class FeedSyncService:
         feed_headers: Mapping[str, Mapping[str, str]] | None = None,
         curl_urls: set[str] | None = None,
         exclude_url_prefixes: Mapping[str, Sequence[str]] | None = None,
+        include_url_prefixes: Mapping[str, Sequence[str]] | None = None,
     ) -> None:
         self._database = database
         self._http_client = http_client
@@ -54,6 +55,9 @@ class FeedSyncService:
         self._curl_urls = set(curl_urls or ())
         self._exclude_url_prefixes = {
             url: tuple(prefixes) for url, prefixes in (exclude_url_prefixes or {}).items()
+        }
+        self._include_url_prefixes = {
+            url: tuple(prefixes) for url, prefixes in (include_url_prefixes or {}).items()
         }
 
     def sync_all(self, feeds: list[FeedRecord]) -> list[FeedSyncResult]:
@@ -106,16 +110,20 @@ class FeedSyncService:
             article_ids = []
             to_translate: list[ArticleRecord] = []
             excluded_prefixes = self._exclude_url_prefixes.get(feed.url, ())
+            included_prefixes = self._include_url_prefixes.get(feed.url, ())
             for entry in entries:
                 article = _entry_to_article(
                     entry,
                     feed.url,
                     max_article_chars=self._limits.max_article_chars,
                     exclude_url_prefixes=excluded_prefixes,
+                    include_url_prefixes=included_prefixes,
                 )
                 if article is None:
-                    if _matches_url_prefix(
-                        _entry_canonical_url(entry, feed.url), excluded_prefixes
+                    if _is_filtered_url(
+                        _entry_canonical_url(entry, feed.url),
+                        exclude=excluded_prefixes,
+                        include=included_prefixes,
                     ):
                         filtered += 1
                     continue
@@ -171,8 +179,15 @@ def _parse_entries(content: bytes, *, max_entries: int) -> list[object]:
     return entries
 
 
-def _matches_url_prefix(url: str | None, prefixes: Sequence[str]) -> bool:
-    return url is not None and any(url.startswith(prefix) for prefix in prefixes)
+def _is_filtered_url(
+    url: str | None, *, exclude: Sequence[str], include: Sequence[str]
+) -> bool:
+    """Report whether an article URL is dropped by the feed's section filters."""
+    if url is None:
+        return False
+    if any(url.startswith(prefix) for prefix in exclude):
+        return True
+    return bool(include) and not any(url.startswith(prefix) for prefix in include)
 
 
 def _entry_canonical_url(entry: object, feed_url: str) -> str | None:
@@ -189,12 +204,15 @@ def _entry_to_article(
     *,
     max_article_chars: int = 500_000,
     exclude_url_prefixes: Sequence[str] = (),
+    include_url_prefixes: Sequence[str] = (),
 ) -> ArticleInput | None:
     values = entry
     canonical_url = _entry_canonical_url(entry, feed_url)
     if canonical_url is None:
         return None
-    if _matches_url_prefix(canonical_url, exclude_url_prefixes):
+    if _is_filtered_url(
+        canonical_url, exclude=exclude_url_prefixes, include=include_url_prefixes
+    ):
         return None
     content = _bounded_text(_entry_content(values), max_article_chars)
     summary = _bounded_text(_string_value(values.get("summary")), max_article_chars)

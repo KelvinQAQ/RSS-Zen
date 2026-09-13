@@ -446,7 +446,8 @@ exclude_url_prefixes = [
         "https://news.example.test/news/life/#top",
     ],
 )
-def test_rejects_invalid_feed_exclude_url_prefixes(tmp_path: Path, prefix: str) -> None:
+@pytest.mark.parametrize("field", ["exclude_url_prefixes", "include_url_prefixes"])
+def test_rejects_invalid_feed_url_prefixes(tmp_path: Path, prefix: str, field: str) -> None:
     config_path = tmp_path / "rss-zen.toml"
     config_path.write_text(
         _toml_config()
@@ -454,13 +455,38 @@ def test_rejects_invalid_feed_exclude_url_prefixes(tmp_path: Path, prefix: str) 
 [[feeds]]
 name = "Aggregator"
 url = "https://news.example.test/rss/all.xml"
-exclude_url_prefixes = ["{prefix}"]
+{field} = ["{prefix}"]
 """,
         encoding="utf-8",
     )
 
-    with pytest.raises(ConfigurationError, match="exclude_url_prefixes"):
+    with pytest.raises(ConfigurationError, match=field):
         load_config(config_path)
+
+
+def test_loads_normalized_feed_include_url_prefixes(tmp_path: Path) -> None:
+    config_path = tmp_path / "rss-zen.toml"
+    config_path.write_text(
+        _toml_config()
+        + """
+[[feeds]]
+name = "Aggregator"
+url = "https://news.example.test/rss/all.xml"
+include_url_prefixes = [
+  "https://news.example.test/news/world/",
+  "HTTPS://Talk.Example.test/",
+  "https://news.example.test/news/world/",
+]
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.feeds[-1].include_url_prefixes == [
+        "https://news.example.test/news/world/",
+        "https://talk.example.test/",
+    ]
 
 
 def test_rejects_missing_sensitive_feed_header_environment(tmp_path: Path) -> None:

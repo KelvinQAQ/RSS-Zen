@@ -311,16 +311,22 @@ RDF_FEED = """<?xml version="1.0" encoding="UTF-8"?>
 """
 
 def _filtering_service(
-    tmp_path: Path, handler: httpx.MockTransport, prefixes: tuple[str, ...]
+    tmp_path: Path,
+    handler: httpx.MockTransport,
+    prefixes: tuple[str, ...],
+    *,
+    mode: str = "exclude",
 ) -> tuple[Database, FeedSyncService]:
     database = Database(tmp_path / "rss-zen.sqlite3")
     database.initialize()
     client = httpx.Client(transport=handler)
     http_client = FeedHttpClient(client, max_attempts=2, sleep=lambda _: None)
+    filters = {"https://example.test/feed.xml": prefixes}
     return database, FeedSyncService(
         database,
         http_client,
-        exclude_url_prefixes={"https://example.test/feed.xml": prefixes},
+        exclude_url_prefixes=filters if mode == "exclude" else None,
+        include_url_prefixes=filters if mode == "include" else None,
     )
 
 
@@ -357,6 +363,68 @@ def test_sync_keeps_entries_outside_exclude_url_prefixes(tmp_path: Path) -> None
     assert database.get_article(result.article_ids[0]).canonical_url == (
         "https://example.test/articles/first"
     )
+
+
+def test_sync_keeps_only_include_url_prefixes(tmp_path: Path) -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_fixture("sample.rss.xml"))
+
+    database, service = _filtering_service(
+        tmp_path,
+        httpx.MockTransport(handler),
+        ("https://example.test/articles/",),
+        mode="include",
+    )
+    feed = database.upsert_feed(FeedInput(name="RSS", url="https://example.test/feed.xml"))
+
+    result = service.sync_feed(feed)
+
+    assert result.created_articles == 1
+    assert result.filtered_articles == 0
+
+
+def test_sync_include_url_prefixes_drops_everything_else(tmp_path: Path) -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_fixture("sample.rss.xml"))
+
+    database, service = _filtering_service(
+        tmp_path,
+        httpx.MockTransport(handler),
+        ("https://example.test/news/world/",),
+        mode="include",
+    )
+    feed = database.upsert_feed(FeedInput(name="RSS", url="https://example.test/feed.xml"))
+
+    result = service.sync_feed(feed)
+
+    assert result.created_articles == 0
+    assert result.filtered_articles == 1
+    assert database.list_articles() == []
+
+
+def test_sync_exclude_url_prefixes_wins_over_include(tmp_path: Path) -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_fixture("sample.rss.xml"))
+
+    database = Database(tmp_path / "rss-zen.sqlite3")
+    database.initialize()
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    service = FeedSyncService(
+        database,
+        FeedHttpClient(client, max_attempts=2, sleep=lambda _: None),
+        exclude_url_prefixes={
+            "https://example.test/feed.xml": ("https://example.test/articles/",)
+        },
+        include_url_prefixes={
+            "https://example.test/feed.xml": ("https://example.test/articles/",)
+        },
+    )
+    feed = database.upsert_feed(FeedInput(name="RSS", url="https://example.test/feed.xml"))
+
+    result = service.sync_feed(feed)
+
+    assert result.filtered_articles == 1
+    assert database.list_articles() == []
 
 
 def test_sync_uses_dc_date_as_published_at_for_rdf_feeds(tmp_path: Path) -> None:

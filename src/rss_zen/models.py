@@ -267,6 +267,23 @@ _FORBIDDEN_REQUEST_HEADERS = {
 _SECRET_REQUEST_HEADERS = {"authorization", "cookie"}
 
 
+def _normalize_url_prefixes(prefixes: list[str], field: str) -> list[str]:
+    """Validate and normalize absolute HTTPS article URL prefixes."""
+    cleaned: list[str] = []
+    for prefix in prefixes:
+        parsed = urlparse(prefix.strip())
+        if parsed.scheme != "https" or not parsed.netloc:
+            raise ValueError(f"{field} entries must be absolute HTTPS URL prefixes")
+        if parsed.query or parsed.fragment:
+            raise ValueError(f"{field} entries must not contain a query or fragment")
+        normalized = urlunsplit(
+            (parsed.scheme.lower(), parsed.netloc.lower(), parsed.path or "/", "", "")
+        )
+        if normalized not in cleaned:
+            cleaned.append(normalized)
+    return cleaned
+
+
 class FeedConfig(BaseModel):
     """One configured RSS or Atom feed."""
 
@@ -315,23 +332,21 @@ class FeedConfig(BaseModel):
     @field_validator("exclude_url_prefixes")
     @classmethod
     def _safe_exclude_url_prefixes(cls, prefixes: list[str]) -> list[str]:
-        cleaned: list[str] = []
-        for prefix in prefixes:
-            parsed = urlparse(prefix.strip())
-            if parsed.scheme != "https" or not parsed.netloc:
-                raise ValueError(
-                    "exclude_url_prefixes entries must be absolute HTTPS URL prefixes"
-                )
-            if parsed.query or parsed.fragment:
-                raise ValueError(
-                    "exclude_url_prefixes entries must not contain a query or fragment"
-                )
-            normalized = urlunsplit(
-                (parsed.scheme.lower(), parsed.netloc.lower(), parsed.path or "/", "", "")
-            )
-            if normalized not in cleaned:
-                cleaned.append(normalized)
-        return cleaned
+        return _normalize_url_prefixes(prefixes, "exclude_url_prefixes")
+
+    include_url_prefixes: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Absolute HTTPS article URL prefixes to keep. When set, entries that match "
+            "no prefix are dropped before storing, so only the listed sections of an "
+            "aggregator feed survive. exclude_url_prefixes always wins."
+        ),
+    )
+
+    @field_validator("include_url_prefixes")
+    @classmethod
+    def _safe_include_url_prefixes(cls, prefixes: list[str]) -> list[str]:
+        return _normalize_url_prefixes(prefixes, "include_url_prefixes")
 
     @field_validator("url")
     @classmethod

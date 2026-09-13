@@ -292,6 +292,7 @@ def serve(
                     feed_headers=_config_feed_headers(config),
                     curl_urls=_config_curl_urls(config),
                     exclude_url_prefixes=_config_exclude_url_prefixes(config),
+                    include_url_prefixes=_config_include_url_prefixes(config),
                 )
                 scheduler = FeedScheduler(
                     database,
@@ -453,6 +454,7 @@ def sync(
                 feed_headers=_config_feed_headers(config),
                 curl_urls=_config_curl_urls(config),
                 exclude_url_prefixes=_config_exclude_url_prefixes(config),
+                include_url_prefixes=_config_include_url_prefixes(config),
             ).sync_all(feeds)
     except AppError as error:
         _handle_app_error(error)
@@ -1975,4 +1977,13 @@ def _config_exclude_url_prefixes(config: AppConfig) -> dict[str, tuple[str, ...]
         normalize_feed_url(feed.url): tuple(feed.exclude_url_prefixes)
         for feed in config.feeds
         if feed.exclude_url_prefixes
+    }
+
+
+def _config_include_url_prefixes(config: AppConfig) -> dict[str, tuple[str, ...]]:
+    """Index per-feed article URL prefixes to keep; everything else is dropped."""
+    return {
+        normalize_feed_url(feed.url): tuple(feed.include_url_prefixes)
+        for feed in config.feeds
+        if feed.include_url_prefixes
     }
