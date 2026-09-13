@@ -109,6 +109,11 @@ language = "en"
 # header_env = { Authorization = "PRIVATE_FEED_TOKEN" }       # sensitive headers from env
 # fetcher = "curl"  # optional: fetch via system curl for sources that fingerprint
 #                    # Python's TLS stack (e.g. Nitter RSS: rss.xcancel.com/<handle>/rss)
+# Section filters for aggregator feeds: matching entries are dropped before they
+# reach SQLite, so unwanted columns never cost storage, translation, or export work.
+# exclude_url_prefixes = ["https://news.example.invalid/sport/"]          # denylist
+# include_url_prefixes = ["https://news.example.invalid/world/"]          # allowlist
+#                                                                         # (exclude wins)
 
 [[exports]]
 name = "daily"
