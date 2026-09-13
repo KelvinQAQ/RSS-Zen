@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import calendar
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from urllib.parse import SplitResult, urljoin, urlsplit, urlunsplit
@@ -25,6 +25,7 @@ class FeedSyncResult:
     feed_id: int
     created_articles: int = 0
     updated_articles: int = 0
+    filtered_articles: int = 0
     not_modified: bool = False
     article_ids: tuple[int, ...] = ()
     error_code: str | None = None
@@ -43,6 +44,7 @@ class FeedSyncService:
         limits: LimitsSettings | None = None,
         feed_headers: Mapping[str, Mapping[str, str]] | None = None,
         curl_urls: set[str] | None = None,
+        exclude_url_prefixes: Mapping[str, Sequence[str]] | None = None,
     ) -> None:
         self._database = database
         self._http_client = http_client
@@ -50,6 +52,9 @@ class FeedSyncService:
         self._limits = limits or LimitsSettings()
         self._feed_headers = {url: dict(headers) for url, headers in (feed_headers or {}).items()}
         self._curl_urls = set(curl_urls or ())
+        self._exclude_url_prefixes = {
+            url: tuple(prefixes) for url, prefixes in (exclude_url_prefixes or {}).items()
+        }
 
     def sync_all(self, feeds: list[FeedRecord]) -> list[FeedSyncResult]:
         """Synchronize all requested feeds, retaining a result for every feed."""
@@ -97,13 +102,22 @@ class FeedSyncService:
             )
             created = 0
             updated = 0
+            filtered = 0
             article_ids = []
             to_translate: list[ArticleRecord] = []
+            excluded_prefixes = self._exclude_url_prefixes.get(feed.url, ())
             for entry in entries:
                 article = _entry_to_article(
-                    entry, feed.url, max_article_chars=self._limits.max_article_chars
+                    entry,
+                    feed.url,
+                    max_article_chars=self._limits.max_article_chars,
+                    exclude_url_prefixes=excluded_prefixes,
                 )
                 if article is None:
+                    if _matches_url_prefix(
+                        _entry_canonical_url(entry, feed.url), excluded_prefixes
+                    ):
+                        filtered += 1
                     continue
                 reconciliation = self._database.reconcile_article(feed.id, article)
                 article_ids.append(reconciliation.article.id)
@@ -130,6 +144,7 @@ class FeedSyncService:
                 feed_id=feed.id,
                 created_articles=created,
                 updated_articles=updated,
+                filtered_articles=filtered,
                 article_ids=tuple(article_ids),
             )
         finally:
@@ -156,14 +171,31 @@ def _parse_entries(content: bytes, *, max_entries: int) -> list[object]:
     return entries
 
 
-def _entry_to_article(
-    entry: object, feed_url: str, *, max_article_chars: int = 500_000
-) -> ArticleInput | None:
-    values = entry
-    link = values.get("link")
+def _matches_url_prefix(url: str | None, prefixes: Sequence[str]) -> bool:
+    return url is not None and any(url.startswith(prefix) for prefix in prefixes)
+
+
+def _entry_canonical_url(entry: object, feed_url: str) -> str | None:
+    """Resolve one entry's absolute article URL, or None when it has no link."""
+    link = entry.get("link") if hasattr(entry, "get") else None
     if not isinstance(link, str) or not link.strip():
         return None
-    canonical_url = _normalize_article_url(urljoin(feed_url, link))
+    return _normalize_article_url(urljoin(feed_url, link))
+
+
+def _entry_to_article(
+    entry: object,
+    feed_url: str,
+    *,
+    max_article_chars: int = 500_000,
+    exclude_url_prefixes: Sequence[str] = (),
+) -> ArticleInput | None:
+    values = entry
+    canonical_url = _entry_canonical_url(entry, feed_url)
+    if canonical_url is None:
+        return None
+    if _matches_url_prefix(canonical_url, exclude_url_prefixes):
+        return None
     content = _bounded_text(_entry_content(values), max_article_chars)
     summary = _bounded_text(_string_value(values.get("summary")), max_article_chars)
     tags = values.get("tags", [])

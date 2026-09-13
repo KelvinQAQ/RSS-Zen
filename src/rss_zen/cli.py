@@ -291,6 +291,7 @@ def serve(
                     limits=config.limits,
                     feed_headers=_config_feed_headers(config),
                     curl_urls=_config_curl_urls(config),
+                    exclude_url_prefixes=_config_exclude_url_prefixes(config),
                 )
                 scheduler = FeedScheduler(
                     database,
@@ -451,6 +452,7 @@ def sync(
                 limits=config.limits,
                 feed_headers=_config_feed_headers(config),
                 curl_urls=_config_curl_urls(config),
+                exclude_url_prefixes=_config_exclude_url_prefixes(config),
             ).sync_all(feeds)
     except AppError as error:
         _handle_app_error(error)
@@ -464,7 +466,8 @@ def sync(
         else:
             typer.echo(
                 f"feed_id={result.feed_id} created={result.created_articles} "
-                f"updated={result.updated_articles} not_modified={result.not_modified}"
+                f"updated={result.updated_articles} filtered={result.filtered_articles} "
+                f"not_modified={result.not_modified}"
             )
     if failures:
         raise typer.Exit(code=1)
@@ -1964,3 +1967,12 @@ def _config_feed_headers(config: AppConfig) -> dict[str, dict[str, str]]:
 def _config_curl_urls(config: AppConfig) -> set[str]:
     """Collect normalized feed URLs whose fetcher uses the system curl binary."""
     return {normalize_feed_url(feed.url) for feed in config.feeds if feed.fetcher == "curl"}
+
+
+def _config_exclude_url_prefixes(config: AppConfig) -> dict[str, tuple[str, ...]]:
+    """Index per-feed article URL prefixes to drop before storing."""
+    return {
+        normalize_feed_url(feed.url): tuple(feed.exclude_url_prefixes)
+        for feed in config.feeds
+        if feed.exclude_url_prefixes
+    }

@@ -412,6 +412,57 @@ header_env = { Authorization = "PRIVATE_FEED_TOKEN" }
     assert "private-token" not in private.model_dump_json()
 
 
+def test_loads_normalized_feed_exclude_url_prefixes(tmp_path: Path) -> None:
+    config_path = tmp_path / "rss-zen.toml"
+    config_path.write_text(
+        _toml_config()
+        + """
+[[feeds]]
+name = "Aggregator"
+url = "https://news.example.test/rss/all.xml"
+exclude_url_prefixes = [
+  "https://news.example.test/news/life/",
+  "HTTPS://ENT.Example.test/",
+  "https://news.example.test/news/life/",
+]
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.feeds[-1].exclude_url_prefixes == [
+        "https://news.example.test/news/life/",
+        "https://ent.example.test/",
+    ]
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "http://news.example.test/news/life/",
+        "/news/life/",
+        "https://news.example.test/news/life/?page=2",
+        "https://news.example.test/news/life/#top",
+    ],
+)
+def test_rejects_invalid_feed_exclude_url_prefixes(tmp_path: Path, prefix: str) -> None:
+    config_path = tmp_path / "rss-zen.toml"
+    config_path.write_text(
+        _toml_config()
+        + f"""
+[[feeds]]
+name = "Aggregator"
+url = "https://news.example.test/rss/all.xml"
+exclude_url_prefixes = ["{prefix}"]
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigurationError, match="exclude_url_prefixes"):
+        load_config(config_path)
+
+
 def test_rejects_missing_sensitive_feed_header_environment(tmp_path: Path) -> None:
     config_path = tmp_path / "rss-zen.toml"
     config_path.write_text(

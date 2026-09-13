@@ -310,6 +310,54 @@ RDF_FEED = """<?xml version="1.0" encoding="UTF-8"?>
 </rdf:RDF>
 """
 
+def _filtering_service(
+    tmp_path: Path, handler: httpx.MockTransport, prefixes: tuple[str, ...]
+) -> tuple[Database, FeedSyncService]:
+    database = Database(tmp_path / "rss-zen.sqlite3")
+    database.initialize()
+    client = httpx.Client(transport=handler)
+    http_client = FeedHttpClient(client, max_attempts=2, sleep=lambda _: None)
+    return database, FeedSyncService(
+        database,
+        http_client,
+        exclude_url_prefixes={"https://example.test/feed.xml": prefixes},
+    )
+
+
+def test_sync_drops_entries_matching_exclude_url_prefixes(tmp_path: Path) -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_fixture("sample.rss.xml"))
+
+    database, service = _filtering_service(
+        tmp_path, httpx.MockTransport(handler), ("https://example.test/articles/",)
+    )
+    feed = database.upsert_feed(FeedInput(name="RSS", url="https://example.test/feed.xml"))
+
+    result = service.sync_feed(feed)
+
+    assert result.created_articles == 0
+    assert result.filtered_articles == 1
+    assert result.article_ids == ()
+    assert database.list_articles() == []
+
+
+def test_sync_keeps_entries_outside_exclude_url_prefixes(tmp_path: Path) -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_fixture("sample.rss.xml"))
+
+    database, service = _filtering_service(
+        tmp_path, httpx.MockTransport(handler), ("https://example.test/news/life/",)
+    )
+    feed = database.upsert_feed(FeedInput(name="RSS", url="https://example.test/feed.xml"))
+
+    result = service.sync_feed(feed)
+
+    assert result.created_articles == 1
+    assert result.filtered_articles == 0
+    assert database.get_article(result.article_ids[0]).canonical_url == (
+        "https://example.test/articles/first"
+    )
+
 
 def test_sync_uses_dc_date_as_published_at_for_rdf_feeds(tmp_path: Path) -> None:
     """RSS 1.0 items carry only dc:date, which feedparser exposes as `updated`."""
