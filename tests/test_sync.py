@@ -293,6 +293,40 @@ def test_sync_parses_atom_full_content(tmp_path: Path) -> None:
     assert article.categories == ("News",)
 
 
+RDF_FEED = """<?xml version="1.0" encoding="UTF-8"?>
+<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+         xmlns="http://purl.org/rss/1.0/"
+         xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <channel rdf:about="https://example.test/rdf.xml">
+    <title>RDF feed</title>
+    <link>https://example.test/</link>
+  </channel>
+  <item rdf:about="https://example.test/rdf-item-1">
+    <title>RDF item</title>
+    <link>https://example.test/rdf-item-1</link>
+    <description>RDF summary</description>
+    <dc:date>2026-09-13T13:14:00Z</dc:date>
+  </item>
+</rdf:RDF>
+"""
+
+
+def test_sync_uses_dc_date_as_published_at_for_rdf_feeds(tmp_path: Path) -> None:
+    """RSS 1.0 items carry only dc:date, which feedparser exposes as `updated`."""
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=RDF_FEED.encode("utf-8"))
+
+    database, service = _service(tmp_path, httpx.MockTransport(handler))
+    feed = database.upsert_feed(FeedInput(name="RDF", url="https://example.test/rdf.xml"))
+
+    result = service.sync_feed(feed)
+    article = database.get_article(result.article_ids[0])
+
+    assert article.published_at == "2026-09-13T13:14:00+00:00"
+    assert article.source_updated_at == "2026-09-13T13:14:00+00:00"
+
+
 def test_sync_updates_article_when_source_content_changes(tmp_path: Path) -> None:
     response_contents = [
         _fixture("sample.rss.xml"),

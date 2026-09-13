@@ -179,7 +179,12 @@ def _entry_to_article(
         content=content,
         author=_bounded_text(_string_value(values.get("author")), max_article_chars),
         categories=categories,
-        published_at=_entry_timestamp(values, "published_parsed", "published"),
+        # RSS 1.0/RDF feeds (e.g. DW) expose the item date only as `updated`
+        # (dc:date), so fall back to it instead of storing a NULL published_at.
+        published_at=(
+            _entry_timestamp(values, "published_parsed", "published")
+            or _entry_timestamp(values, "updated_parsed", "updated")
+        ),
         source_updated_at=_entry_timestamp(values, "updated_parsed", "updated"),
     )
 
